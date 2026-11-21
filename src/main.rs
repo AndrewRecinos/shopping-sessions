@@ -1420,6 +1420,8 @@ fn props() -> Arc<WriterProperties> {
         WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+            .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("top_category"), true)
             .build(),
     )
 }
@@ -1485,15 +1487,15 @@ fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], users: &Interner) {
             None,
         ),
         Col::I32(rows.iter().map(|r| r.day).collect()),
-        Col::I64(rows.iter().map(|r| r.sessions).collect()),
-        Col::I64(rows.iter().map(|r| r.events).collect()),
+        Col::I32(rows.iter().map(|r| r.sessions as i32).collect()),
+        Col::I32(rows.iter().map(|r| r.events as i32).collect()),
         Col::I64(rows.iter().map(|r| r.revenue).collect()),
         Col::S(tops, Some(defs)),
     ];
     write_cols(
         path,
-        "message user_daily { required binary user_id (UTF8); required int32 day (DATE); required int64 sessions; \
-         required int64 events; required int64 revenue_cents; optional binary top_category (UTF8); }",
+        "message user_daily { required binary user_id (UTF8); required int32 day (DATE); required int32 sessions; \
+         required int32 events; required int64 revenue_cents; optional binary top_category (UTF8); }",
         cols,
         rows.len(),
     );
