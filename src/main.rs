@@ -881,10 +881,11 @@ fn run() {
     drop(shards);
     let ltab = &ltab;
     // ---------------- events: parse into eid buckets
+    let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / nt / NB;
     let eraw = par(
         ech.len(),
         nt,
-        || (0..NB).map(|_| Vec::<ERaw>::new()).collect::<Vec<_>>(),
+        || (0..NB).map(|_| Vec::<ERaw>::with_capacity(ecap)).collect::<Vec<_>>(),
         |i, bk| {
             let mut tc = TC0;
             for_rows::<7>(ech[i], |f| {
