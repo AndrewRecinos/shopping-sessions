@@ -834,23 +834,45 @@ fn run() {
         }
     }
     let all_ids: Vec<(u64, &[u8])> = (0..LS).flat_map(|sidx| shards[sidx].1.iter().copied()).collect();
-    let mut minid: Vec<u32> = (0..nid as u32).collect();
-    for i in 0..nid as u32 {
-        let r = find(&mut parent, i) as usize;
-        let (a, b) = (all_ids[i as usize], all_ids[minid[r] as usize]);
-        if if (a.0 | b.0) & FB == 0 { a.0 < b.0 } else { a.1 < b.1 } {
-            minid[r] = i;
-        }
+    // roots (read-only walks) and component minimum ID, both in parallel
+    use std::sync::atomic::AtomicU32;
+    const RB: usize = 1 << 16;
+    let nrb = nid.div_ceil(RB);
+    let root: Vec<AtomicU32> = (0..nid).map(|_| AtomicU32::new(0)).collect();
+    let minid: Vec<AtomicU32> = (0..nid).map(|_| AtomicU32::new(u32::MAX)).collect();
+    {
+        let (parent, root, minid, all_ids) = (&parent, &root, &minid, &all_ids);
+        let less = |i: u32, j: u32| {
+            let (a, b) = (all_ids[i as usize], all_ids[j as usize]);
+            if (a.0 | b.0) & FB == 0 { a.0 < b.0 } else { a.1 < b.1 }
+        };
+        par(nrb, nt, || (), |q, _| {
+            for i in q * RB..((q + 1) * RB).min(nid) {
+                let mut r = i as u32;
+                while parent[r as usize] != r {
+                    r = parent[r as usize];
+                }
+                root[i].store(r, Ordering::Relaxed);
+                let m = &minid[r as usize];
+                let mut cur = m.load(Ordering::Relaxed);
+                while cur == u32::MAX || less(i as u32, cur) {
+                    match m.compare_exchange_weak(cur, i as u32, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(c) => cur = c,
+                    }
+                }
+            }
+        });
     }
     {
-        let (parent, minid, all_ids, off) = (&parent, &minid, &all_ids, &off);
+        let (root, minid, all_ids, off) = (&root, &minid, &all_ids, &off);
         let slots: Vec<std::sync::Mutex<&mut (FxHashMap<u64, u64>, Vec<(u64, &[u8])>)>> =
             shards.iter_mut().map(std::sync::Mutex::new).collect();
         par(LS, nt, || (), |sidx, _| {
             let mut g = slots[sidx].lock().unwrap();
             g.0.retain(|&k, v| {
                 let gi = off[sidx] + *v as usize;
-                *v = all_ids[minid[parent[gi] as usize] as usize].0;
+                *v = all_ids[minid[root[gi].load(Ordering::Relaxed) as usize].load(Ordering::Relaxed) as usize].0;
                 *v != k
             });
             g.0.shrink_to_fit();
