@@ -198,4 +198,7 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   - 1024 hash buckets instead of 256 (buckets fit L2; local A/B total min 0.96->0.79, med 1.01->0.94): docker ~1.13-1.26 s (noisy)
   - clicks: two-pass chunk parse with prefetched person lookup (parse_clicks 0.078->0.051s): 1.06 s
   - tried, no gain (reverted): link bitset filter, hash-table dedup (slower than sort), u64 composite session sort key, MIMALLOC_LARGE_OS_PAGES
-- [ ] 60M safety run
+- [x] 60M safety run (seed 3, 60M events / 15M clicks, 5.4 GB; data deleted after): 3 docker runs
+  wall 5.05 / 4.21 / 3.72 s, exit 0, no OOM; peak RSS ~10.6 GB = ~5.5 GB file-mapped input
+  (reclaimable) + ~5 GB anon. Binary logs `mem peak` (VmHWM) to stderr at exit. Docker here
+  runs in a VM, so container cgroup memory.peak isn't readable from WSL.

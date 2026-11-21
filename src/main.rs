@@ -1082,6 +1082,10 @@ fn run() {
     });
     t("write", &mut t0);
     eprintln!("total {:.3}s", t_all.elapsed().as_secs_f64());
+    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+        let kb = |k: &str| st.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0) / 1024;
+        eprintln!("mem peak {} MiB (anon {} MiB, file-mapped {} MiB)", kb("VmHWM:"), kb("RssAnon:"), kb("RssFile:"));
+    }
     std::process::exit(0);
 }
 
