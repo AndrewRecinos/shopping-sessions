@@ -72,126 +72,148 @@ fn for_lines<'a>(data: &'static [u8], mut f: impl FnMut(&'static [u8])) {
     }
 }
 
-/// Bitmask of bytes in `p[0..16]` equal to ',', '"' or '\n'.
+/// Masks of (',' or '\n') and '"' in `p[0..16]`.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn special16(p: &[u8]) -> u32 {
+fn masks16(p: &[u8]) -> (u32, u32) {
     use std::arch::x86_64::*;
     debug_assert!(p.len() >= 16);
     unsafe {
         let v = _mm_loadu_si128(p.as_ptr() as *const __m128i);
         let a = _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8));
-        let b = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
         let c = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8));
-        _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(a, b), c)) as u32
+        let b = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
+        (_mm_movemask_epi8(_mm_or_si128(a, c)) as u32, _mm_movemask_epi8(b) as u32)
     }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn special16(p: &[u8]) -> u32 {
-    let mut m = 0;
-    for i in 0..16 {
-        m |= ((p[i] == b',' || p[i] == b'"' || p[i] == b'\n') as u32) << i;
-    }
-    m
 }
 
 /// Call `f` with the N fields of every well-formed row of a line-aligned chunk.
-/// Stage 1 indexes every ',', '"', '\n' (SIMD); stage 2 walks fields. Any line that
-/// doesn't match the strict fast shape is re-parsed with the exact `split`.
+/// Stage 1 (SIMD) indexes every ',' and '\n' and stores per-64-byte quote bitmasks.
+/// Stage 2 takes a line's N separators directly (no dependency chain between fields):
+/// the first N-1 must be commas and the N-th a newline; a field starting with '"' must
+/// have length >= 2 and end with '"', and the line must hold exactly 2 quotes per such
+/// field (popcount). Anything else is re-parsed with the exact `split`.
 #[inline(always)]
 fn for_rows<const N: usize>(data: &'static [u8], f: impl FnMut(&[&'static [u8]; N])) {
-    thread_local!(static IDX: std::cell::RefCell<Vec<u32>> = Default::default());
-    IDX.with(|c| for_rows_idx(data, &mut c.borrow_mut(), f))
+    thread_local!(static B: std::cell::RefCell<(Vec<u32>, Vec<u64>)> = Default::default());
+    B.with(|c| { let b = &mut *c.borrow_mut(); rows_impl(data, &mut b.0, &mut b.1, f) })
 }
 
 #[inline(always)]
-fn for_rows_idx<const N: usize>(data: &'static [u8], idx: &mut Vec<u32>, mut f: impl FnMut(&[&'static [u8]; N])) {
+fn rows_impl<const N: usize>(data: &'static [u8], sep: &mut Vec<u32>, qm: &mut Vec<u64>, mut f: impl FnMut(&[&'static [u8]; N])) {
     let len = data.len();
-    idx.clear();
-    idx.reserve(len + 3 * N + 64);
+    let nw = len.div_ceil(64);
+    sep.clear();
+    sep.reserve(len + 2 * N + 64);
+    qm.clear();
+    qm.resize(nw + 2, 0);
     unsafe {
-        let p = idx.as_mut_ptr();
+        let p = sep.as_mut_ptr();
         let mut n = 0usize;
         let mut base = 0usize;
+        let mut w = 0usize;
         while base + 64 <= len {
             let d = &data[base..];
-            let mut m = special16(d) as u64
-                | (special16(&d[16..]) as u64) << 16
-                | (special16(&d[32..]) as u64) << 32
-                | (special16(&d[48..]) as u64) << 48;
+            let (a0, q0) = masks16(d);
+            let (a1, q1) = masks16(&d[16..]);
+            let (a2, q2) = masks16(&d[32..]);
+            let (a3, q3) = masks16(&d[48..]);
+            let mut m = a0 as u64 | (a1 as u64) << 16 | (a2 as u64) << 32 | (a3 as u64) << 48;
+            *qm.get_unchecked_mut(w) = q0 as u64 | (q1 as u64) << 16 | (q2 as u64) << 32 | (q3 as u64) << 48;
             let cnt = m.count_ones() as usize;
             let b = base as u32;
-            let mut w = p.add(n);
+            let mut wp = p.add(n);
             loop {
                 for q in 0..8 {
-                    *w.add(q) = b + m.trailing_zeros();
+                    *wp.add(q) = b + m.trailing_zeros();
                     m &= m.wrapping_sub(1);
                 }
                 if m == 0 {
                     break;
                 }
-                w = w.add(8);
+                wp = wp.add(8);
             }
             n += cnt;
             base += 64;
+            w += 1;
         }
+        let mut qq = 0u64;
         while base < len {
             let c = data[base];
-            if c == b',' || c == b'"' || c == b'\n' {
+            if c == b',' || c == b'\n' {
                 *p.add(n) = base as u32;
                 n += 1;
             }
+            qq |= ((c == b'"') as u64) << (base & 63);
             base += 1;
         }
-        for _ in 0..3 * N + 8 {
+        if len % 64 != 0 {
+            qm[len / 64] = qq;
+        }
+        for _ in 0..2 * N + 8 {
             *p.add(n) = len as u32;
             n += 1;
         }
-        idx.set_len(n);
+        sep.set_len(n);
     }
-    let at = |p: usize| -> u8 { if p < len { data[p] } else { b'\n' } };
+    let sep: &[u32] = &sep[..];
+    let qm: &[u64] = &qm[..];
+    let at = |p: usize| -> u8 { if p < len { unsafe { *data.get_unchecked(p) } } else { b'\n' } };
+    // quotes in [a, b)
+    let qcount = |a: usize, b: usize| -> u32 {
+        let (wa, wb) = (a >> 6, b >> 6);
+        let ma = !0u64 << (a & 63);
+        let mb = (1u64 << (b & 63)).wrapping_sub(1);
+        let span = wb - wa;
+        if span <= 2 {
+            // branch-free for lines spanning up to 3 words (qm has 2 words of padding)
+            let m0 = ma & if span == 0 { mb } else { !0 };
+            let m1 = if span == 0 { 0 } else if span == 1 { mb } else { !0 };
+            let m2 = if span == 2 { mb } else { 0 };
+            unsafe {
+                (qm.get_unchecked(wa) & m0).count_ones() + (qm.get_unchecked(wa + 1) & m1).count_ones() + (qm.get_unchecked(wa + 2) & m2).count_ones()
+            }
+        } else {
+            let mut c = (qm[wa] & ma).count_ones() + (qm[wb] & mb).count_ones();
+            for w in wa + 1..wb {
+                c += qm[w].count_ones();
+            }
+            c
+        }
+    };
     let mut fields = [&b""[..]; N];
-    let mut ls = 0usize; // line start
-    let mut k = 0usize; // index into idx at line start
+    let mut ls = 0usize;
+    let mut k = 0usize;
     while ls < len {
-        let mut j = k;
-        let mut s = ls;
-        let mut good = true;
-        let mut sep = 0usize;
+        let e_last = sep[k + N - 1] as usize;
+        let mut good = at(e_last) == b'\n';
+        let mut nq = 0u32;
         let mut se = [(0usize, 0usize); N];
         for fi in 0..N {
-            let p0 = idx[j] as usize;
-            let p1 = idx[j + 1] as usize;
-            let p2 = idx[j + 2] as usize;
-            let c0 = at(p0);
-            let quoted = (p0 == s) & (c0 == b'"');
-            let ok = if quoted { (at(p1) == b'"') & (p2 == p1 + 1) & (at(p2) != b'"') } else { c0 != b'"' };
-            let start = s + quoted as usize;
-            let end = if quoted { p1 } else { p0 };
-            sep = if quoted { p2 } else { p0 };
-            j += 1 + 2 * quoted as usize;
-            good &= ok & ((at(sep) == b'\n') == (fi == N - 1));
-            se[fi] = (start, end);
-            s = sep + 1;
+            let s = if fi == 0 { ls } else { sep[k + fi - 1] as usize + 1 };
+            let e = sep[k + fi] as usize;
+            if fi + 1 < N {
+                good &= at(e) == b',';
+            }
+            let q = (at(s) == b'"') & (s < e);
+            let ok = !q | ((e >= s + 2) & (at(e.wrapping_sub(1)) == b'"'));
+            good &= ok;
+            nq += q as u32;
+            se[fi] = (s + q as usize, e - q as usize);
         }
-        if good {
+        if good && qcount(ls, e_last) == 2 * nq {
             for fi in 0..N {
                 fields[fi] = unsafe { data.get_unchecked(se[fi].0..se[fi].1) };
             }
-        }
-        if good {
             f(&fields);
-            ls = sep + 1;
-            k = j;
+            ls = e_last + 1;
+            k += N;
         } else {
-            // slow path: find this line's end from its first special
             let mut j = k;
-            while at(idx[j] as usize) != b'\n' {
+            while at(sep[j] as usize) != b'\n' {
                 j += 1;
             }
-            let nl = idx[j] as usize;
+            let nl = sep[j] as usize;
             if nl > ls && split(&data[ls..nl], &mut fields) {
                 f(&fields);
             }
@@ -199,6 +221,17 @@ fn for_rows_idx<const N: usize>(data: &'static [u8], idx: &mut Vec<u32>, mut f: 
             k = j + 1;
         }
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn masks16(p: &[u8]) -> (u32, u32) {
+    let (mut a, mut b) = (0, 0);
+    for i in 0..16 {
+        a |= ((p[i] == b',' || p[i] == b'\n') as u32) << i;
+        b |= ((p[i] == b'"') as u32) << i;
+    }
+    (a, b)
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -1554,11 +1587,11 @@ mod tests {
     fn rows_match_split() {
         let mut x: u64 = 12345;
         let alpha = b"ab,,\"\"\n\r x";
-        for it in 0..200_000 {
+        for it in 0..400_000 {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            let n = (x % 300) as usize;
+            let n = if it % 10 == 0 { (x % 3000) as usize } else { (x % 300) as usize };
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 x ^= x << 13;
