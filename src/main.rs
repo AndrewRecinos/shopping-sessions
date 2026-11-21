@@ -1098,10 +1098,11 @@ fn run() {
     t("dedup_events", &mut t0);
 
     // ---------------- clicks
+    let ccap = cch.iter().map(|c| c.len()).sum::<usize>() / 40 / nt / NB + 16;
     let ckb = par(
         cch.len(),
         nt,
-        || ((0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(), Vec::<Ck>::new()),
+        || ((0..NB).map(|_| Vec::<Ck>::with_capacity(ccap)).collect::<Vec<_>>(), Vec::<Ck>::new()),
         |i, (out, tmp)| {
             tmp.clear();
             
