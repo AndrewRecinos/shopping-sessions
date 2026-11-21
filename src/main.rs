@@ -371,6 +371,59 @@ fn hash64(k: u64) -> u64 {
     (k ^ (k >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+const EMPTY: u64 = u64::MAX;
+
+/// Leaked anonymous mapping advised for transparent huge pages (fewer TLB misses).
+fn huge_slice<T: Copy>(n: usize, init: T) -> &'static mut [T] {
+    let bytes = (n * std::mem::size_of::<T>()).max(1);
+    let m = memmap2::MmapMut::map_anon(bytes).expect("anon map");
+    #[cfg(target_os = "linux")]
+    let _ = m.advise(memmap2::Advice::HugePage);
+    let m = Box::leak(Box::new(m));
+    let s = unsafe { std::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut T, n) };
+    s.fill(init);
+    s
+}
+
+/// Open-addressing u64 -> u64 table (linear probing within 64 regions chosen by the
+/// top 6 hash bits, so regions can be filled in parallel). Missing key -> key itself.
+struct LTab {
+    slots: &'static mut [(u64, u64)],
+    shift: u32,
+    rmask: usize,
+}
+
+impl LTab {
+    #[inline(always)]
+    fn home(&self, k: u64) -> usize {
+        (hash64(k) >> self.shift) as usize
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u64 {
+        let h = self.home(k);
+        let base = h & !self.rmask;
+        let mut i = h;
+        loop {
+            let (kk, v) = unsafe { *self.slots.get_unchecked(i) };
+            if kk == k {
+                return v;
+            }
+            if kk == EMPTY {
+                return k;
+            }
+            i = base | ((i + 1) & self.rmask);
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add(self.home(k)) as *const i8, _MM_HINT_T0);
+        }
+    }
+}
+
 fn map_file(p: &Path) -> Option<&'static Mmap> {
     map_file0(p).map(|m| &*Box::leak(Box::new(m)))
 }
@@ -723,11 +776,28 @@ fn run() {
     drop(upairs);
     drop(lparsed);
     t("links", &mut t0);
-    let shards = &shards;
-    let person = |u: &'static [u8]| -> u64 {
-        let k = ukey(u);
-        shards[lshard(k)].0.get(&k).copied().unwrap_or(k)
-    };
+    // flatten into the open-addressing table; region r holds shard r's keys
+    let maxn = shards.iter().map(|s| s.0.len()).max().unwrap_or(0);
+    let rsize = (maxn * 2).next_power_of_two().max(16);
+    let ltab = LTab { slots: huge_slice(rsize * LS, (EMPTY, 0)), shift: 64 - (rsize * LS).trailing_zeros(), rmask: rsize - 1 };
+    {
+        let shift = ltab.shift;
+        let regions: Vec<std::sync::Mutex<&mut [(u64, u64)]>> = ltab.slots.chunks_mut(rsize).map(std::sync::Mutex::new).collect();
+        let shards = &shards;
+        par(LS, nt, || (), |r, _| {
+            let mut reg = regions[r].lock().unwrap();
+            for (&k, &v) in &shards[r].0 {
+                let mut i = (hash64(k) >> shift) as usize & (rsize - 1);
+                while reg[i].0 != EMPTY {
+                    i = (i + 1) & (rsize - 1);
+                }
+                reg[i] = (k, v);
+            }
+        });
+    }
+    drop(shards);
+    let ltab = &ltab;
+    let person = |u: &'static [u8]| -> u64 { ltab.get(ukey(u)) };
     // ---------------- events: parse into eid buckets
     let eraw = par(
         ech.len(),
@@ -764,7 +834,7 @@ fn run() {
                     ok = false;
                 }
                 let (pkey, cat, tsr) = if ok {
-                    (person(user), products.get(f[5]).unwrap_or(unknown), (tsv - base) as u32)
+                    (ukey(user), products.get(f[5]).unwrap_or(unknown), (tsv - base) as u32)
                 } else {
                     (0, 0, 0)
                 };
@@ -786,6 +856,14 @@ fn run() {
                 v.extend_from_slice(&tv[b]);
             }
             v.sort_unstable_by_key(|x| (x.ekey, x.ingest));
+            // resolve user key -> person key, prefetching ahead
+            const D: usize = 16;
+            for i in 0..v.len() {
+                if i + D < v.len() {
+                    ltab.prefetch(v[i + D].pkey);
+                }
+                v[i].pkey = ltab.get(v[i].pkey);
+            }
             let mut i = 0;
             while i < v.len() {
                 let r = v[i];
