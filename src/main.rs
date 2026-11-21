@@ -615,6 +615,40 @@ impl LTab {
     }
 }
 
+/// Read whole files with pread into leaked anonymous buffers, in parallel 4 MB pieces.
+fn load_files(paths: &[PathBuf], nt: usize) -> Vec<&'static [u8]> {
+    use std::os::unix::fs::FileExt;
+    const PR: usize = 4 << 20;
+    let files: Vec<(File, usize)> = paths
+        .iter()
+        .filter_map(|p| {
+            let f = File::open(p).ok()?;
+            let n = f.metadata().ok()?.len() as usize;
+            (n > 0).then_some((f, n))
+        })
+        .collect();
+    let bufs: Vec<&'static mut [u8]> = files
+        .iter()
+        .map(|(_, n)| {
+            let m = Box::leak(Box::new(memmap2::MmapMut::map_anon(*n).expect("anon map")));
+            #[cfg(target_os = "linux")]
+            let _ = m.advise(memmap2::Advice::HugePage);
+            &mut m[..]
+        })
+        .collect();
+    let ptrs: Vec<(usize, usize)> = bufs.iter().map(|b| (b.as_ptr() as usize, b.len())).collect();
+    let jobs: Vec<(usize, usize)> = files.iter().enumerate().flat_map(|(i, (_, n))| (0..n.div_ceil(PR)).map(move |q| (i, q * PR))).collect();
+    par(jobs.len(), nt, || (), |j, _| {
+        let (i, off) = jobs[j];
+        let (p, n) = ptrs[i];
+        let len = PR.min(n - off);
+        // each job owns a disjoint range of its file's buffer
+        let dst = unsafe { std::slice::from_raw_parts_mut((p + off) as *mut u8, len) };
+        files[i].0.read_exact_at(dst, off as u64).expect("read");
+    });
+    bufs.into_iter().map(|b| &*b).collect()
+}
+
 fn map_file(p: &Path) -> Option<&'static Mmap> {
     map_file0(p).map(|m| &*Box::leak(Box::new(m)))
 }
@@ -642,7 +676,7 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// File body after the header line.
-fn body(m: &'static Mmap) -> &'static [u8] {
+fn body(m: &'static [u8]) -> &'static [u8] {
     match memchr(b'\n', m) {
         Some(p) => &m[p + 1..],
         None => &[],
@@ -650,7 +684,7 @@ fn body(m: &'static Mmap) -> &'static [u8] {
 }
 
 /// Line-aligned chunks of all bodies.
-fn chunks(maps: &[&'static Mmap]) -> Vec<&'static [u8]> {
+fn chunks(maps: &[&'static [u8]]) -> Vec<&'static [u8]> {
     let mut out = vec![];
     for m in maps {
         let b = body(m);
@@ -822,7 +856,7 @@ fn run() {
     let pm = map_file(&data.join("products.csv"));
     let mut prod_raw: Vec<(&[u8], &[u8])> = vec![];
     if let Some(m) = pm {
-        for_lines(body(m), |l| {
+        for_lines(body(&m[..]), |l| {
             let mut f = [&b""[..]; 2];
             if split(l, &mut f) {
                 prod_raw.push((f[0], f[1]));
@@ -842,7 +876,7 @@ fn run() {
     let cm = map_file(&data.join("campaigns.csv"));
     let mut camps: Vec<(&[u8], &[u8])> = vec![];
     if let Some(m) = cm {
-        for_lines(body(m), |l| {
+        for_lines(body(&m[..]), |l| {
             let mut f = [&b""[..]; 2];
             if split(l, &mut f) {
                 camps.push((f[0], f[1]));
@@ -854,9 +888,13 @@ fn run() {
     t("small_inputs", &mut t0);
 
     // map big files
-    let lmaps: Vec<&Mmap> = list_csv(&data.join("links")).iter().filter_map(|p| map_file(p)).collect();
-    let emaps: Vec<&Mmap> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
-    let cmaps: Vec<&Mmap> = list_csv(&data.join("clicks")).iter().filter_map(|p| map_file(p)).collect();
+    let (lp, ep, cp) = (list_csv(&data.join("links")), list_csv(&data.join("events")), list_csv(&data.join("clicks")));
+    let all = load_files(&[lp.clone(), ep.clone(), cp.clone()].concat(), nt);
+    let nonempty = |v: &[PathBuf]| v.iter().filter(|p| std::fs::metadata(p).map_or(false, |m| m.len() > 0)).count();
+    let (nl, ne) = (nonempty(&lp), nonempty(&ep));
+    let lmaps: Vec<&[u8]> = all[..nl].to_vec();
+    let emaps: Vec<&[u8]> = all[nl..nl + ne].to_vec();
+    let cmaps: Vec<&[u8]> = all[nl + ne..].to_vec();
     let lch = chunks(&lmaps);
     let ech = chunks(&emaps);
     let cch = chunks(&cmaps);
