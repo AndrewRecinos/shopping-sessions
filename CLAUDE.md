@@ -254,3 +254,10 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
     parse vs <= 0.07 s it could remove, and needs a second random pass for winners); in-place dedup
     without the gather copy, emitting from table slots (dedup 0.098 -> 0.137 s) or in record order via
     a winner bitmap (0.107 -> 0.121 s): the contiguous gather is cheaper than random access.
+- Round 5 (sessionize / parse_clicks, main unchanged). Sessionize profile (local, fast-machine state,
+  total 0.095 s): person hashing 0.011, rank+counting sort 0.009, per-person sorts 0.028, session loop
+  0.010, click window + credit + campaign-day updates 0.037. parse_clicks: split ~1/3, ts+campaign ~1/4,
+  user key + person lookup ~1/3, scatter rest. Tried, no gain (A/B, identical output):
+  compact day-major campaign arrays (u32 counts + i64 revenue, assists in one day row): 0.076 vs 0.075;
+  24-byte click record (click_id as packed ptr|len): noise; coarse-ts (ts>>20) pre-bucketing so
+  per-person lists arrive nearly sorted: 0.098 vs 0.094 (extra pass costs more than the sorts save).
