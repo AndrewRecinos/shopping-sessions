@@ -261,3 +261,18 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   compact day-major campaign arrays (u32 counts + i64 revenue, assists in one day row): 0.076 vs 0.075;
   24-byte click record (click_id as packed ptr|len): noise; coarse-ts (ts>>20) pre-bucketing so
   per-person lists arrive nearly sorted: 0.098 vs 0.094 (extra pass costs more than the sorts save).
+- Round 6 (branch scorer-tuned; scorer = Cascade Lake 2.8 GHz, 4 cores + HT, AVX-512, /data tmpfs).
+  - write.campaign: 27.4k rows each built 2 heap ByteArrays (+ refcount); now `Bytes::from_static`
+    for campaign/channel/category/user-ID strings (user IDs unpacked into one leaked buffer), exact
+    reserves, and the campaign merge+write runs on its own thread overlapping the user parts:
+    local 2.5 -> 1.3 ms, off the critical path.
+  - pre-main init negligible: static musl binary exec -> exit 0.48 ms locally; the scorer's 57 ms
+    start->main is container setup.
+  - stage-1 scanner dispatched once per chunk (fn ptr): sse2 (old) / avx2+bmi+popcnt / avx512vl
+    (256-bit k-mask compares, no license downclock) / avx512 (zmm) / avx512c (zmm + vpcompressd).
+    Single-thread 256 MB: stage1 sse2 ~27 ms vs avx2 ~20 ms, but rows_impl total ~75 vs ~66 ms and
+    parse_events end-to-end unchanged (stage 1 is ~10% of parse). AVX-512 variants are gated by
+    AVX512_VERIFIED=false until run under Intel SDE -clx (not available: download needs license).
+    Force a variant at build time with SHOP_SCAN=<name> (verification builds only).
+  - stage 2: zero test instead of popcount when the line has no quoted field (baseline x86-64 has
+    no POPCNT); whole-binary +bmi/+popcnt/+avx2 flags: no local difference.

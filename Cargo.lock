@@ -29,6 +29,7 @@ dependencies = [
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "memchr",
  "memmap2",
  "mimalloc",

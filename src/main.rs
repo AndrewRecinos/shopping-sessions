@@ -96,47 +96,21 @@ fn masks16(p: &[u8]) -> (u32, u32) {
 #[inline(always)]
 fn for_rows<const N: usize>(data: &'static [u8], f: impl FnMut(&[&'static [u8]; N])) {
     thread_local!(static B: std::cell::RefCell<(Vec<u32>, Vec<u64>)> = Default::default());
-    B.with(|c| { let b = &mut *c.borrow_mut(); rows_impl(data, &mut b.0, &mut b.1, f) })
+    B.with(|c| { let b = &mut *c.borrow_mut(); rows_impl(stage1(), data, &mut b.0, &mut b.1, f) })
 }
 
 #[inline(always)]
-fn rows_impl<const N: usize>(data: &'static [u8], sep: &mut Vec<u32>, qm: &mut Vec<u64>, mut f: impl FnMut(&[&'static [u8]; N])) {
+fn rows_impl<const N: usize>(s1: Stage1, data: &'static [u8], sep: &mut Vec<u32>, qm: &mut Vec<u64>, mut f: impl FnMut(&[&'static [u8]; N])) {
     let len = data.len();
     let nw = len.div_ceil(64);
     sep.clear();
-    sep.reserve(len + 2 * N + 64);
+    sep.reserve(len + 2 * N + 80);
     qm.clear();
     qm.resize(nw + 2, 0);
     unsafe {
         let p = sep.as_mut_ptr();
-        let mut n = 0usize;
-        let mut base = 0usize;
-        let mut w = 0usize;
-        while base + 64 <= len {
-            let d = &data[base..];
-            let (a0, q0) = masks16(d);
-            let (a1, q1) = masks16(&d[16..]);
-            let (a2, q2) = masks16(&d[32..]);
-            let (a3, q3) = masks16(&d[48..]);
-            let mut m = a0 as u64 | (a1 as u64) << 16 | (a2 as u64) << 32 | (a3 as u64) << 48;
-            *qm.get_unchecked_mut(w) = q0 as u64 | (q1 as u64) << 16 | (q2 as u64) << 32 | (q3 as u64) << 48;
-            let cnt = m.count_ones() as usize;
-            let b = base as u32;
-            let mut wp = p.add(n);
-            loop {
-                for q in 0..8 {
-                    *wp.add(q) = b + m.trailing_zeros();
-                    m &= m.wrapping_sub(1);
-                }
-                if m == 0 {
-                    break;
-                }
-                wp = wp.add(8);
-            }
-            n += cnt;
-            base += 64;
-            w += 1;
-        }
+        let mut n = s1(data.as_ptr(), len, p, qm.as_mut_ptr());
+        let mut base = len & !63;
         let mut qq = 0u64;
         while base < len {
             let c = data[base];
@@ -181,6 +155,21 @@ fn rows_impl<const N: usize>(data: &'static [u8], sep: &mut Vec<u32>, qm: &mut V
             c
         }
     };
+    // no quote in [a, b)
+    let qnone = |a: usize, b: usize| -> bool {
+        let (wa, wb) = (a >> 6, b >> 6);
+        let ma = !0u64 << (a & 63);
+        let mb = (1u64 << (b & 63)).wrapping_sub(1);
+        let span = wb - wa;
+        if span <= 2 {
+            let m0 = ma & if span == 0 { mb } else { !0 };
+            let m1 = if span == 0 { 0 } else if span == 1 { mb } else { !0 };
+            let m2 = if span == 2 { mb } else { 0 };
+            unsafe { (qm.get_unchecked(wa) & m0) | (qm.get_unchecked(wa + 1) & m1) | (qm.get_unchecked(wa + 2) & m2) == 0 }
+        } else {
+            qcount(a, b) == 0
+        }
+    };
     let mut fields = [&b""[..]; N];
     let mut ls = 0usize;
     let mut k = 0usize;
@@ -201,7 +190,8 @@ fn rows_impl<const N: usize>(data: &'static [u8], sep: &mut Vec<u32>, qm: &mut V
             nq += q as u32;
             se[fi] = (s + q as usize, e - q as usize);
         }
-        if good && qcount(ls, e_last) == 2 * nq {
+        // common case: no quoted field, so the line must hold no quote at all (zero test, no popcount)
+        if good && if nq == 0 { qnone(ls, e_last) } else { qcount(ls, e_last) == 2 * nq } {
             for fi in 0..N {
                 fields[fi] = unsafe { data.get_unchecked(se[fi].0..se[fi].1) };
             }
@@ -221,6 +211,183 @@ fn rows_impl<const N: usize>(data: &'static [u8], sep: &mut Vec<u32>, qm: &mut V
             k = j + 1;
         }
     }
+}
+
+/// Stage 1 of the row scanner: for every full 64-byte block of `data[..len]`, append the
+/// positions of ',' and '\n' to `p` (may write up to 8 garbage slots past the returned count)
+/// and store the block's '"' bitmask in `qm[block]`. Returns the number of positions.
+type Stage1 = unsafe fn(*const u8, usize, *mut u32, *mut u64) -> usize;
+
+/// Positions of the set bits of `m` (block base `b`) appended at `p[n..]`.
+#[inline(always)]
+unsafe fn emit(p: *mut u32, n: usize, b: u32, mut m: u64) -> usize {
+    unsafe {
+        let cnt = m.count_ones() as usize;
+        let mut wp = p.add(n);
+        loop {
+            for q in 0..8 {
+                *wp.add(q) = b + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+            if m == 0 {
+                break;
+            }
+            wp = wp.add(8);
+        }
+        n + cnt
+    }
+}
+
+unsafe fn s1_sse2(d: *const u8, len: usize, p: *mut u32, qm: *mut u64) -> usize {
+    let (mut n, mut base) = (0usize, 0usize);
+    unsafe {
+        while base + 64 <= len {
+            let x = std::slice::from_raw_parts(d.add(base), 64);
+            let (a0, q0) = masks16(x);
+            let (a1, q1) = masks16(&x[16..]);
+            let (a2, q2) = masks16(&x[32..]);
+            let (a3, q3) = masks16(&x[48..]);
+            let m = a0 as u64 | (a1 as u64) << 16 | (a2 as u64) << 32 | (a3 as u64) << 48;
+            *qm.add(base >> 6) = q0 as u64 | (q1 as u64) << 16 | (q2 as u64) << 32 | (q3 as u64) << 48;
+            n = emit(p, n, base as u32, m);
+            base += 64;
+        }
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn s1_avx2(d: *const u8, len: usize, p: *mut u32, qm: *mut u64) -> usize {
+    use std::arch::x86_64::*;
+    let (mut n, mut base) = (0usize, 0usize);
+    let (c, l, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+    unsafe {
+        while base + 64 <= len {
+            let v0 = _mm256_loadu_si256(d.add(base) as *const __m256i);
+            let v1 = _mm256_loadu_si256(d.add(base + 32) as *const __m256i);
+            let a0 = _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v0, l))) as u32;
+            let a1 = _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v1, c), _mm256_cmpeq_epi8(v1, l))) as u32;
+            let q0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, q)) as u32;
+            let q1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, q)) as u32;
+            *qm.add(base >> 6) = q0 as u64 | (q1 as u64) << 32;
+            n = emit(p, n, base as u32, a0 as u64 | (a1 as u64) << 32);
+            base += 64;
+        }
+    }
+    n
+}
+
+/// AVX-512BW, one 512-bit compare per mask.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn s1_avx512(d: *const u8, len: usize, p: *mut u32, qm: *mut u64) -> usize {
+    use std::arch::x86_64::*;
+    let (mut n, mut base) = (0usize, 0usize);
+    let (c, l, q) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b'"' as i8));
+    unsafe {
+        while base + 64 <= len {
+            let v = _mm512_loadu_si512(d.add(base) as *const __m512i);
+            let m = _mm512_cmpeq_epi8_mask(v, c) | _mm512_cmpeq_epi8_mask(v, l);
+            *qm.add(base >> 6) = _mm512_cmpeq_epi8_mask(v, q);
+            n = emit(p, n, base as u32, m);
+            base += 64;
+        }
+    }
+    n
+}
+
+/// AVX-512BW+VL on 256-bit vectors (no 512-bit license downclock).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn s1_avx512vl(d: *const u8, len: usize, p: *mut u32, qm: *mut u64) -> usize {
+    use std::arch::x86_64::*;
+    let (mut n, mut base) = (0usize, 0usize);
+    let (c, l, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+    unsafe {
+        while base + 64 <= len {
+            let v0 = _mm256_loadu_si256(d.add(base) as *const __m256i);
+            let v1 = _mm256_loadu_si256(d.add(base + 32) as *const __m256i);
+            let a0 = _mm256_cmpeq_epi8_mask(v0, c) | _mm256_cmpeq_epi8_mask(v0, l);
+            let a1 = _mm256_cmpeq_epi8_mask(v1, c) | _mm256_cmpeq_epi8_mask(v1, l);
+            let q0 = _mm256_cmpeq_epi8_mask(v0, q);
+            let q1 = _mm256_cmpeq_epi8_mask(v1, q);
+            *qm.add(base >> 6) = q0 as u64 | (q1 as u64) << 32;
+            n = emit(p, n, base as u32, a0 as u64 | (a1 as u64) << 32);
+            base += 64;
+        }
+    }
+    n
+}
+
+/// AVX-512: 512-bit compares, positions written with vpcompressd (16 per 16 input bytes,
+/// stored as a full vector: up to 16 garbage slots past the count, covered by the reserve).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn s1_avx512c(d: *const u8, len: usize, p: *mut u32, qm: *mut u64) -> usize {
+    use std::arch::x86_64::*;
+    let (mut n, mut base) = (0usize, 0usize);
+    let (c, l, q) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b'"' as i8));
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let sixteen = _mm512_set1_epi32(16);
+    unsafe {
+        while base + 64 <= len {
+            let v = _mm512_loadu_si512(d.add(base) as *const __m512i);
+            let m = _mm512_cmpeq_epi8_mask(v, c) | _mm512_cmpeq_epi8_mask(v, l);
+            *qm.add(base >> 6) = _mm512_cmpeq_epi8_mask(v, q);
+            let mut ix = _mm512_add_epi32(iota, _mm512_set1_epi32(base as i32));
+            for k in 0..4 {
+                let mk = (m >> (16 * k)) as u16;
+                _mm512_storeu_si512(p.add(n) as *mut __m512i, _mm512_maskz_compress_epi32(mk, ix));
+                n += mk.count_ones() as usize;
+                ix = _mm512_add_epi32(ix, sixteen);
+            }
+            base += 64;
+        }
+    }
+    n
+}
+
+/// Names and functions of the stage-1 variants usable on this CPU (preferred first).
+fn stage1_variants() -> Vec<(&'static str, Stage1)> {
+    let mut v: Vec<(&'static str, Stage1)> = vec![];
+    #[cfg(target_arch = "x86_64")]
+    {
+        let base = is_x86_feature_detected!("bmi1") && is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("popcnt") && is_x86_feature_detected!("lzcnt");
+        if base && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            v.push(("avx512vl", s1_avx512vl as Stage1));
+            v.push(("avx512", s1_avx512 as Stage1));
+            v.push(("avx512c", s1_avx512c as Stage1));
+        }
+        if base && is_x86_feature_detected!("avx2") {
+            v.push(("avx2", s1_avx2 as Stage1));
+        }
+    }
+    v.push(("sse2", s1_sse2 as Stage1));
+    v
+}
+
+/// AVX-512 variants are auto-selected only once verified under Intel SDE (-clx) against the
+/// fallback on the fuzz test, fixtures, 20M and 60M (no AVX-512 on the dev machine).
+const AVX512_VERIFIED: bool = false;
+
+static STAGE1: std::sync::OnceLock<(&'static str, Stage1)> = std::sync::OnceLock::new();
+
+/// The stage-1 variant in use: the first usable one, or the one named by the build-time
+/// variable SHOP_SCAN (verification builds only).
+fn stage1_sel() -> (&'static str, Stage1) {
+    *STAGE1.get_or_init(|| {
+        let v = stage1_variants();
+        match option_env!("SHOP_SCAN") {
+            Some(name) => *v.iter().find(|x| x.0 == name).expect("SHOP_SCAN variant not usable on this CPU"),
+            None => *v.iter().find(|x| AVX512_VERIFIED || !x.0.starts_with("avx512")).unwrap(),
+        }
+    })
+}
+
+#[inline(always)]
+fn stage1() -> Stage1 {
+    stage1_sel().1
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -799,6 +966,7 @@ fn run() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let nt = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).clamp(1, 64);
+    eprintln!("scan {}", stage1_sel().0);
 
     // manifest
     let man = std::fs::read(data.join("manifest.json")).expect("manifest");
@@ -1415,22 +1583,26 @@ fn run() {
     let cd = outd.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir");
     std::fs::create_dir_all(&cd).expect("mkdir");
-    let mut camp_tot = vec![[0i64; 4]; nc1 * ndays];
-    for r in &results {
-        for (a, b) in camp_tot.iter_mut().zip(r.1.iter()) {
-            for q in 0..4 {
-                a[q] += b[q];
-            }
-        }
-    }
     std::thread::scope(|sc| {
+        // campaign table first (merge + build + write on its own thread), overlapping the user parts
+        let (results, camps, cd) = (&results, &camps, &cd);
+        sc.spawn(move || {
+            let mut camp_tot = vec![[0i64; 4]; nc1 * ndays];
+            for r in results {
+                for (a, b) in camp_tot.iter_mut().zip(r.1.iter()) {
+                    for q in 0..4 {
+                        a[q] += b[q];
+                    }
+                }
+            }
+            write_camp(&cd.join("part-0.parquet"), &camp_tot, camps, ndays, day0);
+        });
         for (ti, r) in results.iter().enumerate() {
             let ud = &ud;
             let cats = &cats;
             let users = &users;
             sc.spawn(move || write_user(&ud.join(format!("part-{ti}.parquet")), &r.0, cats, users));
         }
-        write_camp(&cd.join("part-0.parquet"), &camp_tot, &camps, ndays, day0);
     });
     t("write", &mut t0);
     eprintln!("total {:.3}s", t_all.elapsed().as_secs_f64());
@@ -1493,33 +1665,46 @@ fn write_cols(path: &Path, schema: &str, cols: Vec<Col>, nrows: usize) {
     inner.flush().expect("flush");
 }
 
-fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], users: &Interner) {
+/// ByteArray over 'static bytes: no allocation, clone/drop without refcounting.
+#[inline]
+fn sba(b: &'static [u8]) -> ByteArray {
+    ByteArray::from(bytes::Bytes::from_static(b))
+}
+
+fn write_user(path: &Path, rows: &[URow], cats: &[&'static [u8]], users: &Interner) {
     let mut defs = Vec::with_capacity(rows.len());
     let mut tops = vec![];
     for r in rows {
         match r.top {
             Some(c) => {
                 defs.push(1i16);
-                tops.push(ByteArray::from(cats[c as usize].to_vec()));
+                tops.push(sba(cats[c as usize]));
             }
             None => defs.push(0),
         }
     }
+    // all unpacked user IDs in one leaked buffer (process exits without freeing)
+    let mut buf = Vec::with_capacity(rows.len() * 9);
+    let mut ends = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.pkey & FB == 0 {
+            unpack(b'u', r.pkey, &mut buf);
+        }
+        ends.push(buf.len() as u32);
+    }
+    let buf: &'static [u8] = buf.leak();
+    let mut st = 0usize;
+    let ids = rows
+        .iter()
+        .zip(ends)
+        .map(|(r, e)| {
+            let (a, e) = (st, e as usize);
+            st = e;
+            if r.pkey & FB != 0 { sba(users.bytes(r.pkey)) } else { sba(&buf[a..e]) }
+        })
+        .collect();
     let cols = vec![
-        Col::S(
-            rows.iter()
-                .map(|r| {
-                    if r.pkey & FB != 0 {
-                        ByteArray::from(users.bytes(r.pkey).to_vec())
-                    } else {
-                        let mut v = Vec::with_capacity(9);
-                        unpack(b'u', r.pkey, &mut v);
-                        ByteArray::from(v)
-                    }
-                })
-                .collect(),
-            None,
-        ),
+        Col::S(ids, None),
         Col::I32(rows.iter().map(|r| r.day).collect()),
         Col::I32(rows.iter().map(|r| r.sessions as i32).collect()),
         Col::I32(rows.iter().map(|r| r.events as i32).collect()),
@@ -1535,17 +1720,23 @@ fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], users: &Interner) {
     );
 }
 
-fn write_camp(path: &Path, tot: &[[i64; 4]], camps: &[(&[u8], &[u8])], ndays: usize, day0: i64) {
-    let (mut id, mut ch, mut day, mut s, mut p, mut r, mut a) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+fn write_camp(path: &Path, tot: &[[i64; 4]], camps: &[(&'static [u8], &'static [u8])], ndays: usize, day0: i64) {
+    let tb = Instant::now();
+    let n = tot.iter().filter(|x| x[0] != 0 || x[3] != 0).count();
+    let (mut id, mut ch) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut day = Vec::with_capacity(n);
+    let v = || Vec::<i64>::with_capacity(n);
+    let (mut s, mut p, mut r, mut a) = (v(), v(), v(), v());
     for c in 0..=camps.len() {
-        let (cid, chn): (&[u8], &[u8]) = if c < camps.len() { camps[c] } else { (b"organic", b"organic") };
+        let (cid, chn): (&'static [u8], &'static [u8]) = if c < camps.len() { camps[c] } else { (b"organic", b"organic") };
+        let (cid, chn) = (sba(cid), sba(chn));
         for d in 0..ndays {
             let x = tot[c * ndays + d];
             if x[0] == 0 && x[3] == 0 {
                 continue;
             }
-            id.push(ByteArray::from(cid.to_vec()));
-            ch.push(ByteArray::from(chn.to_vec()));
+            id.push(cid.clone());
+            ch.push(chn.clone());
             day.push((day0 + d as i64) as i32);
             s.push(x[0]);
             p.push(x[1]);
@@ -1553,7 +1744,6 @@ fn write_camp(path: &Path, tot: &[[i64; 4]], camps: &[(&[u8], &[u8])], ndays: us
             a.push(x[3]);
         }
     }
-    let n = id.len();
     write_cols(
         path,
         "message campaign_daily { required binary campaign_id (UTF8); required binary channel (UTF8); \
@@ -1562,6 +1752,7 @@ fn write_camp(path: &Path, tot: &[[i64; 4]], camps: &[(&[u8], &[u8])], ndays: us
         vec![Col::S(id, None), Col::S(ch, None), Col::I32(day), Col::I64(s), Col::I64(p), Col::I64(r), Col::I64(a)],
         n,
     );
+    eprintln!("  write.campaign {:.4}s", tb.elapsed().as_secs_f64());
 }
 
 #[cfg(test)]
@@ -1581,7 +1772,41 @@ mod tests {
     fn fast<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = vec![];
         for_rows::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        // every stage-1 variant usable on this CPU must give the same rows
+        for (name, s1) in stage1_variants() {
+            let (mut a, mut b, mut o2): (_, _, Vec<Vec<Vec<u8>>>) = (vec![], vec![], vec![]);
+            rows_impl::<N>(s1, d, &mut a, &mut b, |f| o2.push(f.iter().map(|x| x.to_vec()).collect()));
+            assert!(o2 == out, "stage1 variant {name} differs");
+        }
         out
+    }
+
+    /// cargo test --release bench_stage1 -- --ignored --nocapture  (BENCH_FILE=path)
+    #[test]
+    #[ignore]
+    fn bench_stage1() {
+        let path = std::env::var("BENCH_FILE").unwrap();
+        let d: &'static [u8] = Box::leak(std::fs::read(path).unwrap().into_boxed_slice());
+        let d = &d[..d.len().min(256 << 20)];
+        let mut sep: Vec<u32> = Vec::with_capacity(d.len() + 100);
+        let mut qm = vec![0u64; d.len() / 64 + 2];
+        for _ in 0..3 {
+            for (name, s1) in stage1_variants() {
+                let t = Instant::now();
+                let mut tot = 0;
+                for c in d.chunks(CHUNK) {
+                    tot += unsafe { s1(c.as_ptr(), c.len(), sep.as_mut_ptr(), qm.as_mut_ptr()) };
+                }
+                let t1 = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let mut rows = 0usize;
+                let (mut a, mut b) = (vec![], vec![]);
+                for c in d.chunks(CHUNK) {
+                    rows_impl::<7>(s1, c, &mut a, &mut b, |f| rows += f[0].len());
+                }
+                eprintln!("{name:9} stage1 {:.1} ms ({tot})  rows_impl {:.1} ms ({rows}) MB {}", t1 * 1e3, t.elapsed().as_secs_f64() * 1e3, d.len() >> 20);
+            }
+        }
     }
 
     #[test]
