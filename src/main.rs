@@ -861,6 +861,8 @@ fn run() {
     let ech = chunks(&emaps);
     let cch = chunks(&cmaps);
     t("map_files", &mut t0);
+    // parse stages run 2 threads per CPU (hides memory latency on hyperthreaded hosts)
+    let pnt = (2 * nt).min(128);
     let users = Interner::new();
     let ukey = |b: &'static [u8]| -> u64 { pack(b'u', b).unwrap_or_else(|| users.key(b)) };
     let eids = Interner::new();
@@ -869,7 +871,7 @@ fn run() {
     let nlines: usize = lmaps.iter().map(|m| memchr::memchr_iter(b'\n', m).count() + 1).sum();
     let ltab = LTab::new(nlines * 5 / 2 + 64);
     let nslot = ltab.slots.len();
-    let upairs = par(lch.len(), nt, Vec::new, |i, pv: &mut Vec<(u32, u32)>| {
+    let upairs = par(lch.len(), pnt, Vec::new, |i, pv: &mut Vec<(u32, u32)>| {
         for_rows::<2>(lch[i], |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
                 pv.push((ltab.insert(ukey(f[0])), ltab.insert(ukey(f[1]))));
@@ -981,12 +983,12 @@ fn run() {
     t("links", &mut t0);
     let ltab = &ctab;
     // ---------------- events: parse into eid buckets
-    let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / nt / NB;
+    let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / pnt / NB;
     let wide1: std::sync::Mutex<FxHashMap<(u64, i64), u16>> = Default::default();
     let wide2: std::sync::Mutex<Vec<(u64, u32, u32, u16)>> = Default::default();
     let eraw = par(
         ech.len(),
-        nt,
+        pnt,
         || (0..NB).map(|_| Vec::<ERaw>::with_capacity(ecap)).collect::<Vec<_>>(),
         |i, bk| {
             
@@ -1098,10 +1100,10 @@ fn run() {
     t("dedup_events", &mut t0);
 
     // ---------------- clicks
-    let ccap = cch.iter().map(|c| c.len()).sum::<usize>() / 40 / nt / NB + 16;
+    let ccap = cch.iter().map(|c| c.len()).sum::<usize>() / 40 / pnt / NB + 16;
     let ckb = par(
         cch.len(),
-        nt,
+        pnt,
         || ((0..NB).map(|_| Vec::<Ck>::with_capacity(ccap)).collect::<Vec<_>>(), Vec::<Ck>::new()),
         |i, (out, tmp)| {
             tmp.clear();
