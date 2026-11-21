@@ -192,4 +192,5 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
 - [ ] Optimizations (record before/after times here) — bench.sh median wall, docker, 20M:
   - baseline: 3.37 s
   - u64 packed keys for u/e IDs (+exact sharded interner fallback), dense p/c_ maps: 1.39 s
+  - two-stage SIMD CSV scanner (specials index + branchless field walk, exact split fallback; fuzz-tested), 1MB chunks, NCPU env honored: 1.22 s
 - [ ] 60M safety run

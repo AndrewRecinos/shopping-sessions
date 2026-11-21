@@ -16,7 +16,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const NB: usize = 256;
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------- CSV
 
@@ -66,6 +66,135 @@ fn for_lines<'a>(data: &'static [u8], mut f: impl FnMut(&'static [u8])) {
             f(&data[s..e]);
         }
         s = e + 1;
+    }
+}
+
+/// Bitmask of bytes in `p[0..16]` equal to ',', '"' or '\n'.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn special16(p: &[u8]) -> u32 {
+    use std::arch::x86_64::*;
+    debug_assert!(p.len() >= 16);
+    unsafe {
+        let v = _mm_loadu_si128(p.as_ptr() as *const __m128i);
+        let a = _mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8));
+        let b = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
+        let c = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8));
+        _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(a, b), c)) as u32
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn special16(p: &[u8]) -> u32 {
+    let mut m = 0;
+    for i in 0..16 {
+        m |= ((p[i] == b',' || p[i] == b'"' || p[i] == b'\n') as u32) << i;
+    }
+    m
+}
+
+/// Call `f` with the N fields of every well-formed row of a line-aligned chunk.
+/// Stage 1 indexes every ',', '"', '\n' (SIMD); stage 2 walks fields. Any line that
+/// doesn't match the strict fast shape is re-parsed with the exact `split`.
+#[inline(always)]
+fn for_rows<const N: usize>(data: &'static [u8], f: impl FnMut(&[&'static [u8]; N])) {
+    thread_local!(static IDX: std::cell::RefCell<Vec<u32>> = Default::default());
+    IDX.with(|c| for_rows_idx(data, &mut c.borrow_mut(), f))
+}
+
+#[inline(always)]
+fn for_rows_idx<const N: usize>(data: &'static [u8], idx: &mut Vec<u32>, mut f: impl FnMut(&[&'static [u8]; N])) {
+    let len = data.len();
+    idx.clear();
+    idx.reserve(len + 3 * N + 64);
+    unsafe {
+        let p = idx.as_mut_ptr();
+        let mut n = 0usize;
+        let mut base = 0usize;
+        while base + 64 <= len {
+            let d = &data[base..];
+            let mut m = special16(d) as u64
+                | (special16(&d[16..]) as u64) << 16
+                | (special16(&d[32..]) as u64) << 32
+                | (special16(&d[48..]) as u64) << 48;
+            let cnt = m.count_ones() as usize;
+            let b = base as u32;
+            let mut w = p.add(n);
+            loop {
+                for q in 0..8 {
+                    *w.add(q) = b + m.trailing_zeros();
+                    m &= m.wrapping_sub(1);
+                }
+                if m == 0 {
+                    break;
+                }
+                w = w.add(8);
+            }
+            n += cnt;
+            base += 64;
+        }
+        while base < len {
+            let c = data[base];
+            if c == b',' || c == b'"' || c == b'\n' {
+                *p.add(n) = base as u32;
+                n += 1;
+            }
+            base += 1;
+        }
+        for _ in 0..3 * N + 8 {
+            *p.add(n) = len as u32;
+            n += 1;
+        }
+        idx.set_len(n);
+    }
+    let at = |p: usize| -> u8 { if p < len { data[p] } else { b'\n' } };
+    let mut fields = [&b""[..]; N];
+    let mut ls = 0usize; // line start
+    let mut k = 0usize; // index into idx at line start
+    while ls < len {
+        let mut j = k;
+        let mut s = ls;
+        let mut good = true;
+        let mut sep = 0usize;
+        let mut se = [(0usize, 0usize); N];
+        for fi in 0..N {
+            let p0 = idx[j] as usize;
+            let p1 = idx[j + 1] as usize;
+            let p2 = idx[j + 2] as usize;
+            let c0 = at(p0);
+            let quoted = (p0 == s) & (c0 == b'"');
+            let ok = if quoted { (at(p1) == b'"') & (p2 == p1 + 1) & (at(p2) != b'"') } else { c0 != b'"' };
+            let start = s + quoted as usize;
+            let end = if quoted { p1 } else { p0 };
+            sep = if quoted { p2 } else { p0 };
+            j += 1 + 2 * quoted as usize;
+            good &= ok & ((at(sep) == b'\n') == (fi == N - 1));
+            se[fi] = (start, end);
+            s = sep + 1;
+        }
+        if good {
+            for fi in 0..N {
+                fields[fi] = unsafe { data.get_unchecked(se[fi].0..se[fi].1) };
+            }
+        }
+        if good {
+            f(&fields);
+            ls = sep + 1;
+            k = j;
+        } else {
+            // slow path: find this line's end from its first special
+            let mut j = k;
+            while at(idx[j] as usize) != b'\n' {
+                j += 1;
+            }
+            let nl = idx[j] as usize;
+            if nl > ls && split(&data[ls..nl], &mut fields) {
+                f(&fields);
+            }
+            ls = nl + 1;
+            k = j + 1;
+        }
     }
 }
 
@@ -430,7 +559,7 @@ fn run() {
     let mut t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    let nt = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(1, 64);
+    let nt = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).clamp(1, 64);
 
     // manifest
     let man = std::fs::read(data.join("manifest.json")).expect("manifest");
@@ -491,16 +620,14 @@ fn run() {
     let ech = chunks(&emaps);
     let cch = chunks(&cmaps);
     t("map_files", &mut t0);
-
     let users = Interner::new();
     let ukey = |b: &'static [u8]| -> u64 { pack(b'u', b).unwrap_or_else(|| users.key(b)) };
     let eids = Interner::new();
 
     // ---------------- links
     let pairs = par(lch.len(), nt, Vec::new, |i, v: &mut Vec<(u64, u64, &[u8], &[u8])>| {
-        for_lines(lch[i], |l| {
-            let mut f = [&b""[..]; 2];
-            if split(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+        for_rows::<2>(lch[i], |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
                 v.push((ukey(f[0]), ukey(f[1]), f[0], f[1]));
             }
         });
@@ -564,16 +691,14 @@ fn run() {
         let k = ukey(u);
         link_map.get(&k).copied().unwrap_or(k)
     };
-
     // ---------------- events: parse into eid buckets
     let eraw = par(
         ech.len(),
         nt,
         || (0..NB).map(|_| Vec::<ERaw>::new()).collect::<Vec<_>>(),
         |i, bk| {
-            for_lines(ech[i], |l| {
-                let mut f = [&b""[..]; 7];
-                if !split(l, &mut f) || f[0].is_empty() {
+            for_rows::<7>(ech[i], |f| {
+                if f[0].is_empty() {
                     return;
                 }
                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
@@ -647,9 +772,8 @@ fn run() {
         nt,
         || (0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(),
         |i, out| {
-            for_lines(cch[i], |l| {
-                let mut f = [&b""[..]; 4];
-                if !split(l, &mut f) || f[0].is_empty() || f[1].is_empty() {
+            for_rows::<4>(cch[i], |f| {
+                if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let ts = match parse_ts(f[3]) {
@@ -955,4 +1079,48 @@ fn write_camp(path: &Path, tot: &[[i64; 4]], camps: &[(&[u8], &[u8])], ndays: us
         vec![Col::S(id, None), Col::S(ch, None), Col::I32(day), Col::I64(s), Col::I64(p), Col::I64(r), Col::I64(a)],
         n,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = vec![];
+        for_lines(d, |l| {
+            let mut f = [&b""[..]; N];
+            if split(l, &mut f) {
+                out.push(f.iter().map(|x| x.to_vec()).collect());
+            }
+        });
+        out
+    }
+    fn fast<const N: usize>(d: &'static [u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = vec![];
+        for_rows::<N>(d, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        out
+    }
+
+    #[test]
+    fn rows_match_split() {
+        let mut x: u64 = 12345;
+        let alpha = b"ab,,\"\"\n\r x";
+        for it in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let n = (x % 300) as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.push(alpha[(x % alpha.len() as u64) as usize]);
+            }
+            let d: &'static [u8] = Box::leak(v.into_boxed_slice());
+            assert_eq!(reference::<2>(d), fast::<2>(d), "N=2 it={it} {:?}", String::from_utf8_lossy(d));
+            assert_eq!(reference::<4>(d), fast::<4>(d), "N=4 it={it}");
+            assert_eq!(reference::<7>(d), fast::<7>(d), "N=7 it={it}");
+        }
+    }
 }
