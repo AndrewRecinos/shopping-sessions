@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+mod probe;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -675,10 +676,13 @@ fn chunks(maps: &[&'static Mmap]) -> Vec<&'static [u8]> {
 /// Run `work(item, &mut state)` over items 0..n on nt threads; returns per-thread states.
 fn par<S: Send, I: Fn() -> S + Sync, F: Fn(usize, &mut S) + Sync>(n: usize, nt: usize, init: I, work: F) -> Vec<S> {
     let next = AtomicUsize::new(0);
-    std::thread::scope(|sc| {
+    let pt0 = Instant::now();
+    let r = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 sc.spawn(|| {
+                    let ts = Instant::now();
+                    probe::PAR_SPAWN.fetch_max((ts - pt0).as_nanos() as u64, Ordering::Relaxed);
                     let mut s = init();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -687,16 +691,21 @@ fn par<S: Send, I: Fn() -> S + Sync, F: Fn(usize, &mut S) + Sync>(n: usize, nt: 
                         }
                         work(i, &mut s);
                     }
+                    probe::PAR_BUSY.fetch_add(ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     s
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    });
+    probe::PAR_WALL.fetch_add(pt0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    probe::PAR_N.fetch_add(1, Ordering::Relaxed);
+    r
 }
 
 fn t(stage: &str, t0: &mut Instant) {
-    eprintln!("{stage} {:.3}s", t0.elapsed().as_secs_f64());
+    let nt = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).clamp(1, 64);
+    eprintln!("{stage} {:.3}s{}", t0.elapsed().as_secs_f64(), probe::par_suffix(nt));
     *t0 = Instant::now();
 }
 
@@ -790,15 +799,20 @@ impl<V: Copy> IdMap<V> {
 // ---------------------------------------------------------------- main
 
 fn main() {
+    let s2m = probe::start_to_now();
+    eprintln!("process start -> main {:.3}s (CLK_TCK resolution)", s2m);
     run();
 }
 
 fn run() {
-    let t_all = Instant::now();
     let mut t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outd = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let nt = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)).clamp(1, 64);
+    let clk = probe::Clock::new();
+    probe::sysinfo(nt, &data, &outd);
+    t("sysinfo", &mut t0);
+    let t_all = Instant::now();
 
     // manifest
     let man = std::fs::read(data.join("manifest.json")).expect("manifest");
@@ -878,6 +892,7 @@ fn run() {
     });
     // lock-free union-find: link the larger root under the smaller (CAS), path halving
     use std::sync::atomic::AtomicU32;
+    t("  links.parse+insert", &mut t0);
     let parent: Vec<AtomicU32> = (0..nslot as u32).map(AtomicU32::new).collect();
     let find = |mut x: u32| -> u32 {
         loop {
@@ -909,6 +924,7 @@ fn run() {
         }
     });
     let parent: Vec<u32> = parent.into_iter().map(|x| x.into_inner()).collect();
+    t("  links.union", &mut t0);
     // component root and byte-wise minimum ID (atomic min), then value = that ID's key
     const RB: usize = 1 << 16;
     let nrb = nslot.div_ceil(RB);
@@ -963,6 +979,7 @@ fn run() {
     drop(upairs);
     drop(parent);
     drop(minid);
+    t("  links.names", &mut t0);
     // compact lookup table holding only IDs whose person key differs from their own
     let moved = |s: &Slot| {
         let k = s.k.load(Ordering::Relaxed);
@@ -978,7 +995,7 @@ fn run() {
             }
         }
     });
-    t("links", &mut t0);
+    t("  links.compact", &mut t0);
     let ltab = &ctab;
     // ---------------- events: parse into eid buckets
     let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / nt / NB;
@@ -1045,10 +1062,12 @@ fn run() {
         nt,
         || ((0..NB).map(|_| Vec::<Ev>::with_capacity(pcap)).collect::<Vec<_>>(), Vec::<u32>::new()),
         |b, (out, tab)| {
+            let mut tk = probe::tsc();
             let mut v: Vec<ERaw> = Vec::with_capacity(eraw.iter().map(|t| t[b].len()).sum());
             for tv in &eraw {
                 v.extend_from_slice(&tv[b]);
             }
+            probe::acc(0, &mut tk);
             // hash dedup: earliest ingest wins (equal ingest copies are identical); losers get pkey 0
             let sz = (v.len() * 2).next_power_of_two().max(64);
             let mask = sz - 1;
@@ -1076,6 +1095,7 @@ fn run() {
                     h = (h + 1) & mask;
                 }
             }
+            probe::acc(1, &mut tk);
             const D: usize = 16;
             for i in 0..v.len() {
                 if i + D < v.len() {
@@ -1091,6 +1111,7 @@ fn run() {
                     out[(hash64(pkey) >> (64 - NBB)) as usize].push(Ev { pkey, ts: r.ts, pc: r.pc });
                 }
             }
+            probe::acc(2, &mut tk);
         },
     );
     let evb: Vec<Vec<Vec<Ev>>> = evb.into_iter().map(|x| x.0).collect();
@@ -1105,7 +1126,7 @@ fn run() {
         || ((0..NB).map(|_| Vec::<Ck>::with_capacity(ccap)).collect::<Vec<_>>(), Vec::<Ck>::new()),
         |i, (out, tmp)| {
             tmp.clear();
-            
+            let mut tk = probe::tsc();
             for_rows::<4>(cch[i], |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -1120,6 +1141,7 @@ fn run() {
                 };
                 tmp.push(Ck { pkey: ukey(f[1]), cid: f[0], ts: (ts - base) as u32, camp });
             });
+            probe::acc(3, &mut tk);
             const D: usize = 16;
             for q in 0..tmp.len() {
                 if q + D < tmp.len() {
@@ -1129,6 +1151,7 @@ fn run() {
                 c.pkey = ltab.get(c.pkey);
                 out[(hash64(c.pkey) >> (64 - NBB)) as usize].push(c);
             }
+            probe::acc(4, &mut tk);
         },
     );
     let ckb: Vec<Vec<Vec<Ck>>> = ckb.into_iter().map(|x| x.0).collect();
@@ -1168,6 +1191,7 @@ fn run() {
             if ne == 0 {
                 return;
             }
+            let mut tk = probe::tsc();
             // distinct persons of this bucket -> provisional ids
             let sz = (ne * 2).next_power_of_two().max(64);
             let mask = sz - 1;
@@ -1208,6 +1232,7 @@ fn run() {
                 }
             }
             let np = sw.prov.len();
+            probe::acc(5, &mut tk);
             // rank persons by key so rows come out in person-key order
             sw.order.clear();
             sw.order.extend(0..np as u32);
@@ -1272,6 +1297,8 @@ fn run() {
                 }
             }
             let mut wi = 0;
+            probe::acc(6, &mut tk);
+            let (mut l_sort, mut l_rest) = (0u64, 0u64);
             for r in 0..np {
                 let pkey = sw.prov[sw.order[r] as usize];
                 let e = &mut sw.es[sw.eoff[r] as usize..sw.eoff[r + 1] as usize];
@@ -1290,6 +1317,7 @@ fn run() {
                     e.sort_unstable();
                 }
                 c.sort_unstable_by_key(|x| x.ts);
+                probe::lap(&mut l_sort, &mut tk);
                 // person
                 let (mut lo, mut hi) = (0usize, 0usize);
                 act.clear();
@@ -1405,7 +1433,10 @@ fn run() {
                     cnt[a as usize] = 0;
                 }
                 act.clear();
+                probe::lap(&mut l_rest, &mut tk);
             }
+            probe::ACC[7].fetch_add(l_sort, Ordering::Relaxed);
+            probe::ACC[8].fetch_add(l_rest, Ordering::Relaxed);
         },
     );
     t("sessionize", &mut t0);
@@ -1428,17 +1459,25 @@ fn run() {
             let ud = &ud;
             let cats = &cats;
             let users = &users;
-            sc.spawn(move || write_user(&ud.join(format!("part-{ti}.parquet")), &r.0, cats, users));
+            sc.spawn(move || {
+                let t = Instant::now();
+                write_user(&ud.join(format!("part-{ti}.parquet")), &r.0, cats, users);
+                probe::PAR_BUSY.fetch_max(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            });
         }
+        let t = Instant::now();
         write_camp(&cd.join("part-0.parquet"), &camp_tot, &camps, ndays, day0);
+        eprintln!("  write.campaign {:.3}s", t.elapsed().as_secs_f64());
     });
+    eprintln!("  write.user max-part {:.3}s", probe::PAR_BUSY.swap(0, Ordering::Relaxed) as f64 / 1e9);
     t("write", &mut t0);
-    eprintln!("total {:.3}s", t_all.elapsed().as_secs_f64());
-    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
-        let kb = |k: &str| st.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0) / 1024;
-        eprintln!("mem peak {} MiB (anon {} MiB, file-mapped {} MiB)", kb("VmHWM:"), kb("RssAnon:"), kb("RssFile:"));
-    }
-    std::process::exit(0);
+    eprintln!("total pipeline {:.3}s | process start -> now {:.3}s", t_all.elapsed().as_secs_f64(), probe::start_to_now());
+    probe::print_acc(&clk, nt);
+    probe::proc_stats("proc after pipeline");
+    let tb = Instant::now();
+    probe::membench(nt);
+    eprintln!("membench took {:.2}s; PROBE BUILD: output written, exiting 1 on purpose", tb.elapsed().as_secs_f64());
+    std::process::exit(1);
 }
 
 // ---------------------------------------------------------------- parquet
