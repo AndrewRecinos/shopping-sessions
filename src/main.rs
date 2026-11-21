@@ -304,12 +304,49 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     Some(t)
 }
 
-const TC0: (u64, u16, i64) = (u64::from_le_bytes(*b"2000-01-"), u16::from_le_bytes(*b"01"), 10957);
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
 
-/// Same result as `parse_ts`, with a one-entry cache of the last validated date
-/// (bytes 0..10 of an F1/F2 string) and a fast path for short digit strings.
+/// Exact lookup of `YYYY-MM-DD` strings for days near the window, indexed by the DD digits.
+/// An entry only matches its own (valid) date bytes, so a hit is always correct; a miss
+/// falls back to full validation.
+struct DateTab {
+    e: [(u64, u16, i64); 166],
+}
+
+impl DateTab {
+    fn new(first_day: i64, last_day: i64) -> Self {
+        let key = |day: i64| -> (u64, u16, i64) {
+            let (y, m, d) = civil_from_days(day);
+            let s = format!("{y:04}-{m:02}-{d:02}");
+            let b = s.as_bytes();
+            (u64::from_le_bytes(b[0..8].try_into().unwrap()), u16::from_le_bytes(b[8..10].try_into().unwrap()), day)
+        };
+        let mut t = DateTab { e: [key(10957); 166] };
+        for day in first_day..=last_day {
+            let k = key(day);
+            if (1000..=9999).contains(&civil_from_days(day).0) {
+                let (_, _, d) = civil_from_days(day);
+                t.e[d as usize] = k;
+            }
+        }
+        t
+    }
+}
+
+/// Same result as `parse_ts`, with a table lookup for dates near the window and a fast
+/// path for short digit strings.
 #[inline(always)]
-fn parse_ts_c(b: &[u8], c: &mut (u64, u16, i64)) -> Option<i64> {
+fn parse_ts_c(b: &[u8], c: &DateTab) -> Option<i64> {
     match parse_ts_f(b, c) {
         Some(t) => Some(t),
         None => parse_ts(b),
@@ -317,41 +354,27 @@ fn parse_ts_c(b: &[u8], c: &mut (u64, u16, i64)) -> Option<i64> {
 }
 
 #[inline(always)]
-fn parse_ts_f(b: &[u8], c: &mut (u64, u16, i64)) -> Option<i64> {
+fn parse_ts_f(b: &[u8], c: &DateTab) -> Option<i64> {
     let n = b.len();
     if n == 20 || n == 25 {
         let lo = u64::from_le_bytes(b[0..8].try_into().unwrap());
         let hi = u16::from_le_bytes(b[8..10].try_into().unwrap());
-        let days = if lo == c.0 && hi == c.1 {
-            c.2
-        } else {
-            let y = d2(b, 0)? * 100 + d2(b, 2)?;
-            if b[4] != b'-' || b[7] != b'-' {
-                return None;
-            }
-            let mo = d2(b, 5)?;
-            let d = d2(b, 8)?;
-            if !(1..=12).contains(&mo) {
-                return None;
-            }
-            let md = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize];
-            if d < 1 || d > md {
-                return None;
-            }
-            let days = days_from_civil(y, mo, d);
-            *c = (lo, hi, days);
-            days
-        };
-        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        let e = &c.e[(b[8] & 15) as usize * 10 + (b[9] & 15) as usize];
+        if lo != e.0 || hi != e.1 || b[10] != b'T' {
             return None;
         }
-        let hh = d2(b, 11)?;
-        let mi = d2(b, 14)?;
-        let ss = d2(b, 17)?;
+        // "HH:MM:SS": digits and colons, then pairwise 10*a+b
+        let v = u64::from_le_bytes(b[11..19].try_into().unwrap());
+        let x = v ^ 0x3030_3030_3030_3030 ^ (0x0A << 16 | 0x0A << 40);
+        if (x | x.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 || x & 0x0000_FF00_00FF_0000 != 0 {
+            return None;
+        }
+        let y = x * 10 + (x >> 8);
+        let (hh, mi, ss) = ((y & 0xFF) as i64, (y >> 24 & 0xFF) as i64, (y >> 48 & 0xFF) as i64);
         if hh > 23 || mi > 59 || ss > 59 {
             return None;
         }
-        let mut t = (((days * 24 + hh) * 60 + mi) * 60 + ss) * 1000;
+        let mut t = (((e.2 * 24 + hh) * 60 + mi) * 60 + ss) * 1000;
         if n == 20 {
             if b[19] != b'Z' {
                 return None;
@@ -725,6 +748,8 @@ fn run() {
     let base = ws - WEEK;
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
+    let dtab = DateTab::new(day0 - 8, (we - 1).div_euclid(DAY) + 2);
+    let dtab = &dtab;
 
     // products / categories
     let pm = map_file(&data.join("products.csv"));
@@ -924,15 +949,15 @@ fn run() {
         nt,
         || (0..NB).map(|_| Vec::<ERaw>::with_capacity(ecap)).collect::<Vec<_>>(),
         |i, bk| {
-            let mut tc = TC0;
+            
             for_rows::<7>(ech[i], |f| {
                 if f[0].is_empty() {
                     return;
                 }
-                let ingest = parse_ts_c(f[3], &mut tc).unwrap_or(i64::MAX);
+                let ingest = parse_ts_c(f[3], dtab).unwrap_or(i64::MAX);
                 let user = f[1];
                 let mut ok = !user.is_empty() && !f[5].is_empty();
-                let ts = parse_ts_c(f[2], &mut tc);
+                let ts = parse_ts_c(f[2], dtab);
                 let tsv = ts.unwrap_or(0);
                 ok &= ts.is_some() && tsv >= ws && tsv < we;
                 let typ = match f[4] {
@@ -1039,12 +1064,12 @@ fn run() {
         || ((0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(), Vec::<Ck>::new()),
         |i, (out, tmp)| {
             tmp.clear();
-            let mut tc = TC0;
+            
             for_rows::<4>(cch[i], |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let ts = match parse_ts_c(f[3], &mut tc) {
+                let ts = match parse_ts_c(f[3], dtab) {
                     Some(t) if t >= ws - WEEK && t < we => t,
                     _ => return,
                 };
@@ -1545,8 +1570,11 @@ mod tests {
             b"1791071890000", b"0001791071890000", b"2026-12-31T00:00:00-00:00", b"99999999999999999999", b"2026-09-16T18:24:20z"];
         let alpha = b"0123456789-:TZ+ z.";
         let mut x: u64 = 777;
-        let mut tc = TC0;
-        for it in 0..2_000_000 {
+        let dd = |y, m, d| days_from_civil(y, m, d);
+        let tabs = [DateTab::new(dd(2026, 9, 1), dd(2026, 10, 3)), DateTab::new(dd(2028, 2, 10), dd(2028, 3, 20)),
+            DateTab::new(dd(2026, 12, 20), dd(2027, 3, 5))];
+        for it in 0..6_000_000 {
+            let tc = &tabs[it % 3];
             x ^= x << 13; x ^= x >> 7; x ^= x << 17;
             let mut v = seeds[(x % 8) as usize].to_vec();
             let k = (x >> 8) % 4;
@@ -1559,7 +1587,7 @@ mod tests {
                     _ => v.insert(p.min(v.len()), alpha[(x >> 20) as usize % alpha.len()]),
                 }
             }
-            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut tc), "it={it} {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(parse_ts(&v), parse_ts_c(&v, tc), "it={it} {:?}", String::from_utf8_lossy(&v));
         }
     }
 
