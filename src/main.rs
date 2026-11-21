@@ -302,6 +302,88 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     Some(t)
 }
 
+const TC0: (u64, u16, i64) = (u64::from_le_bytes(*b"2000-01-"), u16::from_le_bytes(*b"01"), 10957);
+
+/// Same result as `parse_ts`, with a one-entry cache of the last validated date
+/// (bytes 0..10 of an F1/F2 string) and a fast path for short digit strings.
+#[inline(always)]
+fn parse_ts_c(b: &[u8], c: &mut (u64, u16, i64)) -> Option<i64> {
+    match parse_ts_f(b, c) {
+        Some(t) => Some(t),
+        None => parse_ts(b),
+    }
+}
+
+#[inline(always)]
+fn parse_ts_f(b: &[u8], c: &mut (u64, u16, i64)) -> Option<i64> {
+    let n = b.len();
+    if n == 20 || n == 25 {
+        let lo = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let hi = u16::from_le_bytes(b[8..10].try_into().unwrap());
+        let days = if lo == c.0 && hi == c.1 {
+            c.2
+        } else {
+            let y = d2(b, 0)? * 100 + d2(b, 2)?;
+            if b[4] != b'-' || b[7] != b'-' {
+                return None;
+            }
+            let mo = d2(b, 5)?;
+            let d = d2(b, 8)?;
+            if !(1..=12).contains(&mo) {
+                return None;
+            }
+            let md = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(mo - 1) as usize];
+            if d < 1 || d > md {
+                return None;
+            }
+            let days = days_from_civil(y, mo, d);
+            *c = (lo, hi, days);
+            days
+        };
+        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        let hh = d2(b, 11)?;
+        let mi = d2(b, 14)?;
+        let ss = d2(b, 17)?;
+        if hh > 23 || mi > 59 || ss > 59 {
+            return None;
+        }
+        let mut t = (((days * 24 + hh) * 60 + mi) * 60 + ss) * 1000;
+        if n == 20 {
+            if b[19] != b'Z' {
+                return None;
+            }
+        } else {
+            let sign = match b[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let oh = d2(b, 20)?;
+            let om = d2(b, 23)?;
+            if b[22] != b':' || oh > 23 || om > 59 {
+                return None;
+            }
+            t -= sign * (oh * 60 + om) * 60_000;
+        }
+        return Some(t);
+    }
+    if n >= 1 && n <= 18 {
+        let mut v = 0i64;
+        let mut bad = 0u8;
+        for &ch in b {
+            let d = ch.wrapping_sub(b'0');
+            bad |= (d >= 10) as u8;
+            v = v * 10 + d as i64;
+        }
+        if bad == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------- helpers
 
 #[inline]
@@ -804,14 +886,15 @@ fn run() {
         nt,
         || (0..NB).map(|_| Vec::<ERaw>::new()).collect::<Vec<_>>(),
         |i, bk| {
+            let mut tc = TC0;
             for_rows::<7>(ech[i], |f| {
                 if f[0].is_empty() {
                     return;
                 }
-                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                let ingest = parse_ts_c(f[3], &mut tc).unwrap_or(i64::MAX);
                 let user = f[1];
                 let mut ok = !user.is_empty() && !f[5].is_empty();
-                let ts = parse_ts(f[2]);
+                let ts = parse_ts_c(f[2], &mut tc);
                 let tsv = ts.unwrap_or(0);
                 ok &= ts.is_some() && tsv >= ws && tsv < we;
                 let typ = match f[4] {
@@ -888,11 +971,12 @@ fn run() {
         || ((0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(), Vec::<Ck>::new()),
         |i, (out, tmp)| {
             tmp.clear();
+            let mut tc = TC0;
             for_rows::<4>(cch[i], |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let ts = match parse_ts(f[3]) {
+                let ts = match parse_ts_c(f[3], &mut tc) {
                     Some(t) if t >= ws - WEEK && t < we => t,
                     _ => return,
                 };
@@ -1250,6 +1334,30 @@ mod tests {
             assert_eq!(reference::<2>(d), fast::<2>(d), "N=2 it={it} {:?}", String::from_utf8_lossy(d));
             assert_eq!(reference::<4>(d), fast::<4>(d), "N=4 it={it}");
             assert_eq!(reference::<7>(d), fast::<7>(d), "N=7 it={it}");
+        }
+    }
+
+    #[test]
+    fn ts_cache_matches() {
+        let seeds: [&[u8]; 8] = [b"2026-09-16T18:24:20Z", b"2028-02-29T23:59:59+05:30", b"2027-02-29T00:00:00Z",
+            b"1791071890000", b"0001791071890000", b"2026-12-31T00:00:00-00:00", b"99999999999999999999", b"2026-09-16T18:24:20z"];
+        let alpha = b"0123456789-:TZ+ z.";
+        let mut x: u64 = 777;
+        let mut tc = TC0;
+        for it in 0..2_000_000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let mut v = seeds[(x % 8) as usize].to_vec();
+            let k = (x >> 8) % 4;
+            for _ in 0..k {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                let p = (x as usize >> 3) % (v.len() + 1);
+                match x % 3 {
+                    0 if p < v.len() => v[p] = alpha[(x >> 20) as usize % alpha.len()],
+                    1 if p < v.len() => { v.remove(p); }
+                    _ => v.insert(p.min(v.len()), alpha[(x >> 20) as usize % alpha.len()]),
+                }
+            }
+            assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut tc), "it={it} {:?}", String::from_utf8_lossy(&v));
         }
     }
 }
