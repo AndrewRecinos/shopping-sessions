@@ -974,42 +974,61 @@ fn run() {
     t("parse_events", &mut t0);
 
     // ---------------- dedup -> person buckets
+    let pcap = ech.iter().map(|c| c.len()).sum::<usize>() / 70 / nt / NB + 64;
     let evb = par(
         NB,
         nt,
-        || (0..NB).map(|_| Vec::<Ev>::new()).collect::<Vec<_>>(),
-        |b, out| {
+        || ((0..NB).map(|_| Vec::<Ev>::with_capacity(pcap)).collect::<Vec<_>>(), Vec::<u32>::new()),
+        |b, (out, tab)| {
             let mut v: Vec<ERaw> = Vec::with_capacity(eraw.iter().map(|t| t[b].len()).sum());
             for tv in &eraw {
                 v.extend_from_slice(&tv[b]);
             }
-            v.sort_unstable_by_key(|x| (x.ekey, x.ingest));
-            // resolve user key -> person key, prefetching ahead
+            // hash dedup: earliest ingest wins (equal ingest copies are identical); losers get pkey 0
+            let sz = (v.len() * 2).next_power_of_two().max(64);
+            let mask = sz - 1;
+            tab.clear();
+            tab.resize(sz, u32::MAX);
+            for i in 0..v.len() {
+                let k = v[i].ekey;
+                let mut h = (hash64(k) >> 16) as usize & mask;
+                loop {
+                    let j = tab[h];
+                    if j == u32::MAX {
+                        tab[h] = i as u32;
+                        break;
+                    }
+                    let j = j as usize;
+                    if v[j].ekey == k {
+                        if v[i].ingest < v[j].ingest {
+                            v[j].pkey = 0;
+                            tab[h] = i as u32;
+                        } else {
+                            v[i].pkey = 0;
+                        }
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
             const D: usize = 16;
             for i in 0..v.len() {
                 if i + D < v.len() {
                     ltab.prefetch(v[i + D].pkey);
                 }
-                v[i].pkey = ltab.get(v[i].pkey);
-            }
-            let mut i = 0;
-            while i < v.len() {
                 let r = v[i];
-                let mut j = i + 1;
-                while j < v.len() && v[j].ekey == r.ekey {
-                    j += 1;
-                }
                 if r.pkey != 0 {
+                    let pkey = ltab.get(r.pkey);
                     if r.pc >> 24 == ESC && r.pc & 0xFF_FFFF != 0 {
                         let c = wide1.lock().unwrap()[&(r.ekey, r.ingest)];
-                        wide2.lock().unwrap().push((r.pkey, r.ts, r.pc & 0xFF_FFFF, c));
+                        wide2.lock().unwrap().push((pkey, r.ts, r.pc & 0xFF_FFFF, c));
                     }
-                    out[(hash64(r.pkey) >> (64 - NBB)) as usize].push(Ev { pkey: r.pkey, ts: r.ts, pc: r.pc });
+                    out[(hash64(pkey) >> (64 - NBB)) as usize].push(Ev { pkey, ts: r.ts, pc: r.pc });
                 }
-                i = j;
             }
         },
     );
+    let evb: Vec<Vec<Vec<Ev>>> = evb.into_iter().map(|x| x.0).collect();
     drop(eraw);
     t("dedup_events", &mut t0);
 
@@ -1056,39 +1075,155 @@ fn run() {
         wide[(hash64(w.0) >> (64 - NBB)) as usize].push(w);
     }
     wide.iter_mut().for_each(|v| v.sort_unstable());
+    #[derive(Clone, Copy)]
+    struct CS {
+        ts: u32,
+        camp: u32,
+        idx: u32,
+    }
+    #[derive(Default)]
+    struct SW {
+        tab: Vec<u32>,
+        prov: Vec<u64>,
+        rank: Vec<u32>,
+        order: Vec<u32>,
+        lid: Vec<u32>,
+        eoff: Vec<u32>,
+        coff: Vec<u32>,
+        es: Vec<u64>,
+        cs: Vec<CS>,
+    }
     let results = par(
         NB,
         nt,
-        || (Vec::<URow>::new(), vec![[0i64; 4]; nc1 * ndays], vec![0u32; nc1], vec![0u32; nc1], Vec::<u32>::new(), vec![0i64; ncat]),
-        |b, (urows, carr, cnt, pos, act, catsum)| {
-            let mut ev: Vec<Ev> = Vec::with_capacity(evb.iter().map(|t| t[b].len()).sum());
+        || (Vec::<URow>::new(), vec![[0i64; 4]; nc1 * ndays], vec![0u32; nc1], vec![0u32; nc1], Vec::<u32>::new(), vec![0i64; ncat], SW::default()),
+        |b, (urows, carr, cnt, pos, act, catsum, sw)| {
+            let ne: usize = evb.iter().map(|t| t[b].len()).sum();
+            if ne == 0 {
+                return;
+            }
+            // distinct persons of this bucket -> provisional ids
+            let sz = (ne * 2).next_power_of_two().max(64);
+            let mask = sz - 1;
+            sw.tab.clear();
+            sw.tab.resize(sz, u32::MAX);
+            sw.prov.clear();
+            sw.lid.clear();
+            let (tab, prov) = (&mut sw.tab, &mut sw.prov);
+            let mut lookup = |k: u64, insert: bool| -> u32 {
+                let mut h = (hash64(k) >> 16) as usize & mask;
+                loop {
+                    let j = tab[h];
+                    if j == u32::MAX {
+                        if !insert {
+                            return u32::MAX;
+                        }
+                        tab[h] = prov.len() as u32;
+                        prov.push(k);
+                        return tab[h];
+                    }
+                    if prov[j as usize] == k {
+                        return j;
+                    }
+                    h = (h + 1) & mask;
+                }
+            };
             for tv in &evb {
-                ev.extend_from_slice(&tv[b]);
+                for x in &tv[b] {
+                    let l = lookup(x.pkey, true);
+                    sw.lid.push(l);
+                }
             }
-            let mut ck: Vec<Ck> = Vec::with_capacity(ckb.iter().map(|t| t[b].len()).sum());
+            let nck: usize = ckb.iter().map(|t| t[b].len()).sum();
+            let mut clid: Vec<u32> = Vec::with_capacity(nck);
             for tv in &ckb {
-                ck.extend_from_slice(&tv[b]);
+                for x in &tv[b] {
+                    clid.push(lookup(x.pkey, false));
+                }
             }
-            ev.sort_unstable_by_key(|x| (x.pkey, x.ts));
-            ck.sort_unstable_by(|x, y| (x.pkey, x.ts).cmp(&(y.pkey, y.ts)).then_with(|| x.cid.cmp(y.cid)));
-            let mut ci = 0;
+            let np = sw.prov.len();
+            // rank persons by key so rows come out in person-key order
+            sw.order.clear();
+            sw.order.extend(0..np as u32);
+            {
+                let prov = &sw.prov;
+                sw.order.sort_unstable_by_key(|&i| prov[i as usize]);
+            }
+            sw.rank.clear();
+            sw.rank.resize(np, 0);
+            for (r, &i) in sw.order.iter().enumerate() {
+                sw.rank[i as usize] = r as u32;
+            }
+            // counting sort events (ts<<32|pc) and clicks by person rank
+            sw.eoff.clear();
+            sw.eoff.resize(np + 1, 0);
+            sw.coff.clear();
+            sw.coff.resize(np + 1, 0);
+            for l in sw.lid.iter_mut() {
+                *l = sw.rank[*l as usize];
+                sw.eoff[*l as usize + 1] += 1;
+            }
+            for l in clid.iter_mut() {
+                if *l != u32::MAX {
+                    *l = sw.rank[*l as usize];
+                    sw.coff[*l as usize + 1] += 1;
+                }
+            }
+            for q in 0..np {
+                sw.eoff[q + 1] += sw.eoff[q];
+                sw.coff[q + 1] += sw.coff[q];
+            }
+            sw.es.clear();
+            sw.es.resize(ne, 0);
+            let ncs = sw.coff[np] as usize;
+            sw.cs.clear();
+            sw.cs.resize(ncs, CS { ts: 0, camp: 0, idx: 0 });
+            let ck: Vec<Ck> = {
+                let mut v = Vec::with_capacity(nck);
+                for tv in &ckb {
+                    v.extend_from_slice(&tv[b]);
+                }
+                v
+            };
+            {
+                let mut wp: Vec<u32> = sw.eoff[..np].to_vec();
+                let mut i = 0;
+                for tv in &evb {
+                    for x in &tv[b] {
+                        let l = sw.lid[i] as usize;
+                        sw.es[wp[l] as usize] = (x.ts as u64) << 32 | x.pc as u64;
+                        wp[l] += 1;
+                        i += 1;
+                    }
+                }
+                wp.copy_from_slice(&sw.coff[..np]);
+                for (i, x) in ck.iter().enumerate() {
+                    let l = clid[i];
+                    if l != u32::MAX {
+                        sw.cs[wp[l as usize] as usize] = CS { ts: x.ts, camp: x.camp, idx: i as u32 };
+                        wp[l as usize] += 1;
+                    }
+                }
+            }
             let mut wi = 0;
-            let mut i = 0;
-            while i < ev.len() {
-                let pkey = ev[i].pkey;
-                let mut iend = i + 1;
-                while iend < ev.len() && ev[iend].pkey == pkey {
-                    iend += 1;
+            for r in 0..np {
+                let pkey = sw.prov[sw.order[r] as usize];
+                let e = &mut sw.es[sw.eoff[r] as usize..sw.eoff[r + 1] as usize];
+                let c = &mut sw.cs[sw.coff[r] as usize..sw.coff[r + 1] as usize];
+                if e.len() <= 24 {
+                    for x in 1..e.len() {
+                        let v = e[x];
+                        let mut y = x;
+                        while y > 0 && e[y - 1] > v {
+                            e[y] = e[y - 1];
+                            y -= 1;
+                        }
+                        e[y] = v;
+                    }
+                } else {
+                    e.sort_unstable();
                 }
-                while ci < ck.len() && ck[ci].pkey < pkey {
-                    ci += 1;
-                }
-                let mut cend = ci;
-                while cend < ck.len() && ck[cend].pkey == pkey {
-                    cend += 1;
-                }
-                let e = &ev[i..iend];
-                let c = &ck[ci..cend];
+                c.sort_unstable_by_key(|x| x.ts);
                 // person
                 let (mut lo, mut hi) = (0usize, 0usize);
                 act.clear();
@@ -1112,11 +1247,11 @@ fn run() {
                 }
                 let mut k = 0;
                 while k < e.len() {
-                    let start = e[k].ts as i64;
+                    let start = (e[k] >> 32) as i64;
                     let mut j = k + 1;
                     let mut prev = start;
-                    while j < e.len() && (e[j].ts as i64) - prev <= GAP {
-                        prev = e[j].ts as i64;
+                    while j < e.len() && ((e[j] >> 32) as i64) - prev <= GAP {
+                        prev = (e[j] >> 32) as i64;
                         j += 1;
                     }
                     let day = (start + base).div_euclid(DAY) as i32;
@@ -1130,13 +1265,14 @@ fn run() {
                     }
                     let mut rev = 0i64;
                     let mut purch = false;
-                    for x in &e[k..j] {
-                        let mut price = (x.pc & 0xFF_FFFF) as i64;
-                        let mut cat = (x.pc >> 24) as usize;
+                    for &x in &e[k..j] {
+                        let xpc = x as u32;
+                        let mut price = (xpc & 0xFF_FFFF) as i64;
+                        let mut cat = (xpc >> 24) as usize;
                         if cat == ESC as usize && price != 0 {
                             let w = wide[b][wi];
                             wi += 1;
-                            debug_assert!(w.0 == pkey && w.1 == x.ts);
+                            debug_assert!(w.0 == pkey && w.1 == (x >> 32) as u32);
                             (price, cat) = (w.2 as i64, w.3 as usize);
                         }
                         if price != 0 {
@@ -1175,10 +1311,14 @@ fn run() {
                     let credit = if hi > lo {
                         let tt = c[hi - 1].ts;
                         let mut q = hi - 1;
+                        let mut best = q;
                         while q > lo && c[q - 1].ts == tt {
                             q -= 1;
+                            if ck[c[q].idx as usize].cid < ck[c[best].idx as usize].cid {
+                                best = q;
+                            }
                         }
-                        c[q].camp as usize
+                        c[best].camp as usize
                     } else {
                         ncamp
                     };
@@ -1199,8 +1339,6 @@ fn run() {
                     cnt[a as usize] = 0;
                 }
                 act.clear();
-                i = iend;
-                ci = cend;
             }
         },
     );
