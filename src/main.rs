@@ -798,7 +798,6 @@ fn run() {
     }
     drop(shards);
     let ltab = &ltab;
-    let person = |u: &'static [u8]| -> u64 { ltab.get(ukey(u)) };
     // ---------------- events: parse into eid buckets
     let eraw = par(
         ech.len(),
@@ -886,8 +885,9 @@ fn run() {
     let ckb = par(
         cch.len(),
         nt,
-        || (0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(),
-        |i, out| {
+        || ((0..NB).map(|_| Vec::<Ck>::new()).collect::<Vec<_>>(), Vec::<Ck>::new()),
+        |i, (out, tmp)| {
+            tmp.clear();
             for_rows::<4>(cch[i], |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -900,11 +900,20 @@ fn run() {
                     Some(c) => c,
                     None => return,
                 };
-                let pkey = person(f[1]);
-                out[(hash64(pkey) >> (64 - NBB)) as usize].push(Ck { pkey, cid: f[0], ts: (ts - base) as u32, camp });
+                tmp.push(Ck { pkey: ukey(f[1]), cid: f[0], ts: (ts - base) as u32, camp });
             });
+            const D: usize = 16;
+            for q in 0..tmp.len() {
+                if q + D < tmp.len() {
+                    ltab.prefetch(tmp[q + D].pkey);
+                }
+                let mut c = tmp[q];
+                c.pkey = ltab.get(c.pkey);
+                out[(hash64(c.pkey) >> (64 - NBB)) as usize].push(c);
+            }
         },
     );
+    let ckb: Vec<Vec<Vec<Ck>>> = ckb.into_iter().map(|x| x.0).collect();
     t("parse_clicks", &mut t0);
     // ---------------- sessionize + attribute
     let nc1 = ncamp + 1;

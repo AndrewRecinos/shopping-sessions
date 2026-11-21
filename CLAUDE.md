@@ -189,11 +189,13 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
 - [ ] First submission
 - [ ] Per-stage timings on 20M local set
 - [x] Per-stage timings on 20M local set (data/g20, seed 2; reference output in out-ref/g20; `./bench.sh`)
-- [ ] Optimizations (record before/after times here) — bench.sh median wall, docker, 20M:
+- [x] Optimizations (record before/after times here) — bench.sh median wall, docker, 20M:
   - baseline: 3.37 s
   - u64 packed keys for u/e IDs (+exact sharded interner fallback), dense p/c_ maps: 1.39 s
   - two-stage SIMD CSV scanner (specials index + branchless field walk, exact split fallback; fuzz-tested), 1MB chunks, NCPU env honored: 1.22 s
   - parallel sharded link interning, key-order min, drop self-maps (links 0.15->0.07s): 1.37 s vs 1.38 s for previous build in same (noisier) session
   - open-addressing link table (THP-advised) + person lookup moved to dedup with prefetch: 1.12 s
   - 1024 hash buckets instead of 256 (buckets fit L2; local A/B total min 0.96->0.79, med 1.01->0.94): docker ~1.13-1.26 s (noisy)
+  - clicks: two-pass chunk parse with prefetched person lookup (parse_clicks 0.078->0.051s): 1.06 s
+  - tried, no gain (reverted): link bitset filter, hash-table dedup (slower than sort), u64 composite session sort key, MIMALLOC_LARGE_OS_PAGES
 - [ ] 60M safety run
