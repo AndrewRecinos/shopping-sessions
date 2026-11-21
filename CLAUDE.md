@@ -240,3 +240,17 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
     links 0.05, write 0.036.
 - [x] 60M check (seed 3, data/g60 kept, reference out-ref/g60 = output of 7cdef88): identical,
   local 5.6 s -> ~2.1 s, peak 10 GB (anon 4.1 GB).
+- Round 4. Scorer: d2f424b = 1.26 s (pinned bench 1.02 s), 42nd. Env vars read: only DATA_DIR,
+  OUTPUT_DIR, NCPU (verified). Scorer-experiment branches (one factor each vs d2f424b, all pass
+  test.sh docker + identical 20M):
+  - exp-read 1640c5e: pread into THP-advised anon buffers (parallel 4 MB) instead of mmap; bench wall 0.931 s
+  - exp-populate 303f658: parallel MADV_POPULATE_READ of mmaps (touch fallback); local parse_events
+    0.255 -> 0.195 s for +0.017 s populate; bench wall 0.978 s
+  - exp-16threads 75b6e3b: 2x threads in link/event/click parse; bench wall 0.974 s
+  Bytes per event on main (approx): DRAM-level ~210 B = input line 76 + ERaw write 32 + gather read 32
+  + link-table line ~40 (40% hit) + Ev write 16 + 2x Ev read 16; plus ~80 B L2-level (gather copy,
+  dedup table, es/lid arrays).
+  - tried, no gain: fused parse+dedup into one global concurrent table (insert alone costs +0.09 s in
+    parse vs <= 0.07 s it could remove, and needs a second random pass for winners); in-place dedup
+    without the gather copy, emitting from table slots (dedup 0.098 -> 0.137 s) or in record order via
+    a winner bitmap (0.107 -> 0.121 s): the contiguous gather is cheaper than random access.
