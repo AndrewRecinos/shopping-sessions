@@ -15,7 +15,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
-const NB: usize = 256;
+const NBB: u32 = 10;
+const NB: usize = 1 << NBB;
 const CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------- CSV
@@ -839,7 +840,7 @@ fn run() {
                     (0, 0, 0)
                 };
                 let ekey = pack(b'e', f[0]).unwrap_or_else(|| eids.key(f[0]));
-                bk[(hash64(ekey) >> 56) as usize].push(ERaw { ekey, ingest, pkey, ts: tsr, price, cat, typ, ok });
+                bk[(hash64(ekey) >> (64 - NBB)) as usize].push(ERaw { ekey, ingest, pkey, ts: tsr, price, cat, typ, ok });
             });
         },
     );
@@ -872,7 +873,7 @@ fn run() {
                     j += 1;
                 }
                 if r.ok {
-                    out[(hash64(r.pkey) >> 56) as usize].push(Ev { pkey: r.pkey, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
+                    out[(hash64(r.pkey) >> (64 - NBB)) as usize].push(Ev { pkey: r.pkey, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
                 }
                 i = j;
             }
@@ -900,7 +901,7 @@ fn run() {
                     None => return,
                 };
                 let pkey = person(f[1]);
-                out[(hash64(pkey) >> 56) as usize].push(Ck { pkey, cid: f[0], ts: (ts - base) as u32, camp });
+                out[(hash64(pkey) >> (64 - NBB)) as usize].push(Ck { pkey, cid: f[0], ts: (ts - base) as u32, camp });
             });
         },
     );
