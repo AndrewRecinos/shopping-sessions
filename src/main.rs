@@ -625,17 +625,55 @@ fn run() {
     let eids = Interner::new();
 
     // ---------------- links
-    let pairs = par(lch.len(), nt, Vec::new, |i, v: &mut Vec<(u64, u64, &[u8], &[u8])>| {
-        for_rows::<2>(lch[i], |f| {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                v.push((ukey(f[0]), ukey(f[1]), f[0], f[1]));
+    const LS: usize = 64;
+    let lshard = |k: u64| (hash64(k) >> 58) as usize;
+    let lparsed = par(
+        lch.len(),
+        nt,
+        || (Vec::new(), (0..LS).map(|_| Vec::new()).collect::<Vec<_>>()),
+        |i, (pv, sh): &mut (Vec<(u64, u64)>, Vec<Vec<(u64, &'static [u8])>>)| {
+            for_rows::<2>(lch[i], |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
+                    let (ka, kb) = (ukey(f[0]), ukey(f[1]));
+                    pv.push((ka, kb));
+                    sh[lshard(ka)].push((ka, f[0]));
+                    sh[lshard(kb)].push((kb, f[1]));
+                }
+            });
+        },
+    );
+    // intern per shard: key -> local index (later overwritten with the person key)
+    let mut shards: Vec<(FxHashMap<u64, u64>, Vec<(u64, &[u8])>)> = (0..LS).map(|_| Default::default()).collect();
+    {
+        let slots: Vec<std::sync::Mutex<&mut (FxHashMap<u64, u64>, Vec<(u64, &[u8])>)>> =
+            shards.iter_mut().map(std::sync::Mutex::new).collect();
+        par(LS, nt, || (), |sidx, _| {
+            let mut g = slots[sidx].lock().unwrap();
+            let (m, ids) = &mut **g;
+            for tp in &lparsed {
+                for &(k, b) in &tp.1[sidx] {
+                    m.entry(k).or_insert_with(|| {
+                        ids.push((k, b));
+                        (ids.len() - 1) as u64
+                    });
+                }
             }
         });
+    }
+    let mut off = vec![0usize; LS + 1];
+    for sidx in 0..LS {
+        off[sidx + 1] = off[sidx] + shards[sidx].1.len();
+    }
+    let nid = off[LS];
+    let gid = |k: u64| -> u32 {
+        let sidx = lshard(k);
+        (off[sidx] + shards[sidx].0[&k] as usize) as u32
+    };
+    let upairs = par(lparsed.len(), nt, Vec::new, |ti, v: &mut Vec<(u32, u32)>| {
+        v.extend(lparsed[ti].0.iter().map(|&(a, b)| (gid(a), gid(b))));
     });
-    let mut ids: FxHashMap<u64, u32> = FxHashMap::default();
-    let mut id_bytes: Vec<(u64, &[u8])> = vec![];
-    let mut parent: Vec<u32> = vec![];
-    let mut size: Vec<u32> = vec![];
+    let mut parent: Vec<u32> = (0..nid as u32).collect();
+    let mut size: Vec<u32> = vec![1; nid];
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         let mut r = x;
         while parent[r as usize] != r {
@@ -648,18 +686,8 @@ fn run() {
         }
         r
     }
-    for v in &pairs {
-        for &(ka, kb, a, b) in v {
-            let mut intern = |k: u64, s: &'static [u8]| -> u32 {
-                *ids.entry(k).or_insert_with(|| {
-                    id_bytes.push((k, s));
-                    parent.push(parent.len() as u32);
-                    size.push(1);
-                    (id_bytes.len() - 1) as u32
-                })
-            };
-            let ia = intern(ka, a);
-            let ib = intern(kb, b);
+    for v in &upairs {
+        for &(ia, ib) in v {
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
@@ -669,27 +697,36 @@ fn run() {
             }
         }
     }
-    let nid = id_bytes.len();
+    let all_ids: Vec<(u64, &[u8])> = (0..LS).flat_map(|sidx| shards[sidx].1.iter().copied()).collect();
     let mut minid: Vec<u32> = (0..nid as u32).collect();
     for i in 0..nid as u32 {
         let r = find(&mut parent, i) as usize;
-        if id_bytes[i as usize].1 < id_bytes[minid[r] as usize].1 {
+        let (a, b) = (all_ids[i as usize], all_ids[minid[r] as usize]);
+        if if (a.0 | b.0) & FB == 0 { a.0 < b.0 } else { a.1 < b.1 } {
             minid[r] = i;
         }
     }
-    let mut link_map: FxHashMap<u64, u64> = FxHashMap::default();
-    for i in 0..nid {
-        let m = minid[parent[i] as usize] as usize;
-        if m != i {
-            link_map.insert(id_bytes[i].0, id_bytes[m].0);
-        }
+    {
+        let (parent, minid, all_ids, off) = (&parent, &minid, &all_ids, &off);
+        let slots: Vec<std::sync::Mutex<&mut (FxHashMap<u64, u64>, Vec<(u64, &[u8])>)>> =
+            shards.iter_mut().map(std::sync::Mutex::new).collect();
+        par(LS, nt, || (), |sidx, _| {
+            let mut g = slots[sidx].lock().unwrap();
+            g.0.retain(|&k, v| {
+                let gi = off[sidx] + *v as usize;
+                *v = all_ids[minid[parent[gi] as usize] as usize].0;
+                *v != k
+            });
+            g.0.shrink_to_fit();
+        });
     }
-    drop(ids);
+    drop(upairs);
+    drop(lparsed);
     t("links", &mut t0);
-    let link_map = &link_map;
+    let shards = &shards;
     let person = |u: &'static [u8]| -> u64 {
         let k = ukey(u);
-        link_map.get(&k).copied().unwrap_or(k)
+        shards[lshard(k)].0.get(&k).copied().unwrap_or(k)
     };
     // ---------------- events: parse into eid buckets
     let eraw = par(
