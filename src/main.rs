@@ -861,6 +861,28 @@ fn run() {
     let ech = chunks(&emaps);
     let cch = chunks(&cmaps);
     t("map_files", &mut t0);
+    // populate all input mappings up front, in parallel 4 MB ranges (MADV_POPULATE_READ,
+    // falling back to touching one byte per page)
+    {
+        const PR: usize = 4 << 20;
+        let jobs: Vec<(&Mmap, usize)> = lmaps.iter().chain(&emaps).chain(&cmaps).flat_map(|m| (0..m.len().div_ceil(PR)).map(move |q| (*m, q * PR))).collect();
+        par(jobs.len(), nt, || (), |j, _| {
+            let (m, off) = jobs[j];
+            let len = PR.min(m.len() - off);
+            #[cfg(target_os = "linux")]
+            let done = m.advise_range(memmap2::Advice::PopulateRead, off, len).is_ok();
+            #[cfg(not(target_os = "linux"))]
+            let done = false;
+            if !done {
+                let mut x = 0u8;
+                for p in (off..off + len).step_by(4096) {
+                    x ^= unsafe { std::ptr::read_volatile(m.as_ptr().add(p)) };
+                }
+                std::hint::black_box(x);
+            }
+        });
+    }
+    t("populate", &mut t0);
     let users = Interner::new();
     let ukey = |b: &'static [u8]| -> u64 { pack(b'u', b).unwrap_or_else(|| users.key(b)) };
     let eids = Interner::new();
