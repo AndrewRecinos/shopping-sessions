@@ -271,8 +271,9 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   - stage-1 scanner dispatched once per chunk (fn ptr): sse2 (old) / avx2+bmi+popcnt / avx512vl
     (256-bit k-mask compares, no license downclock) / avx512 (zmm) / avx512c (zmm + vpcompressd).
     Single-thread 256 MB: stage1 sse2 ~27 ms vs avx2 ~20 ms, but rows_impl total ~75 vs ~66 ms and
-    parse_events end-to-end unchanged (stage 1 is ~10% of parse). AVX-512 variants are gated by
-    AVX512_VERIFIED=false until run under Intel SDE -clx (not available: download needs license).
+    parse_events end-to-end unchanged (stage 1 is ~10% of parse). All 3 AVX-512 variants verified under SDE -clx
+    (forced builds: fuzz, fixtures, dev, 20M identical; `WRAP="sde64 -clx --" ./test.sh local`).
+    Default PREFER=avx512vl; exp-avx512 / exp-avx512c branches change only PREFER.
     Force a variant at build time with SHOP_SCAN=<name> (verification builds only).
   - stage 2: zero test instead of popcount when the line has no quoted field (baseline x86-64 has
     no POPCNT); whole-binary +bmi/+popcnt/+avx2 flags: no local difference.

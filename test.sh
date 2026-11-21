@@ -13,7 +13,7 @@ if [ "$MODE" = docker ]; then
   run() { IMAGE=shopping-sessions:latest "$STARTER/scripts/docker_run.sh" "$1" "$2" >/dev/null 2>"$2.err"; }
 else
   cargo build --release -q 2>&1 | grep -E '^error' -A5 | head -20
-  run() { DATA_DIR="$1" OUTPUT_DIR="$2" "$ROOT/target/release/app" 2>"$2.err"; }
+  run() { DATA_DIR="$1" OUTPUT_DIR="$2" ${WRAP:-} "$ROOT/target/release/app" 2>"$2.err"; }  # WRAP: e.g. "sde64 -clx --"
 fi
 for d in "$FX"/*/; do
   c=$(basename "$d"); data="$d/input"; [ -d "$d/data" ] && data="$d/data"

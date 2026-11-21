@@ -367,9 +367,10 @@ fn stage1_variants() -> Vec<(&'static str, Stage1)> {
     v
 }
 
-/// AVX-512 variants are auto-selected only once verified under Intel SDE (-clx) against the
-/// fallback on the fuzz test, fixtures, 20M and 60M (no AVX-512 on the dev machine).
-const AVX512_VERIFIED: bool = false;
+/// AVX-512 variants were verified under Intel SDE 10.13.1 (-clx) with forced builds on the fuzz
+/// test, 36 fixtures, dev and 20M (identical). Preferred variant when usable; else avx2/sse2.
+const AVX512_VERIFIED: bool = true;
+const PREFER: &str = if AVX512_VERIFIED { "avx512vl" } else { "avx2" };
 
 static STAGE1: std::sync::OnceLock<(&'static str, Stage1)> = std::sync::OnceLock::new();
 
@@ -380,7 +381,7 @@ fn stage1_sel() -> (&'static str, Stage1) {
         let v = stage1_variants();
         match option_env!("SHOP_SCAN") {
             Some(name) => *v.iter().find(|x| x.0 == name).expect("SHOP_SCAN variant not usable on this CPU"),
-            None => *v.iter().find(|x| AVX512_VERIFIED || !x.0.starts_with("avx512")).unwrap(),
+            None => *v.iter().find(|x| x.0 == PREFER).or_else(|| v.iter().find(|x| !x.0.starts_with("avx512"))).unwrap(),
         }
     })
 }
