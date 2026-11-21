@@ -188,5 +188,8 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   (tools/tester, python+polars) since the host has no pip. Dev set: data/dev.
 - [ ] First submission
 - [ ] Per-stage timings on 20M local set
-- [ ] Optimizations (record before/after times here)
+- [x] Per-stage timings on 20M local set (data/g20, seed 2; reference output in out-ref/g20; `./bench.sh`)
+- [ ] Optimizations (record before/after times here) — bench.sh median wall, docker, 20M:
+  - baseline: 3.37 s
+  - u64 packed keys for u/e IDs (+exact sharded interner fallback), dense p/c_ maps: 1.39 s
 - [ ] 60M safety run

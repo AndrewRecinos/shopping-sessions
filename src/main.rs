@@ -181,9 +181,65 @@ fn hash_bytes(b: &[u8]) -> u64 {
     h.finish().wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+
+/// Pack `prefix[0-9a-z]{1,8}` into a u64 (big-endian, zero padded; top bit 0).
+/// Injective, and preserves byte order among packed IDs of the same prefix.
 #[inline]
-fn bucket(b: &[u8]) -> usize {
-    (hash_bytes(b) >> 56) as usize
+fn pack(prefix: u8, b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    if n < 2 || n > 9 || b[0] != prefix {
+        return None;
+    }
+    let mut v = 0u64;
+    for &c in &b[1..] {
+        if !(c.is_ascii_digit() || c.is_ascii_lowercase()) {
+            return None;
+        }
+        v = (v << 8) | c as u64;
+    }
+    Some(v << (8 * (9 - n)))
+}
+
+fn unpack(prefix: u8, k: u64, out: &mut Vec<u8>) {
+    out.push(prefix);
+    for c in k.to_be_bytes() {
+        if c != 0 {
+            out.push(c);
+        }
+    }
+}
+
+const FB: u64 = 1 << 63;
+
+/// Exact interning for IDs that don't match the fast pattern: key = FB | idx<<6 | shard.
+struct Interner {
+    shards: Vec<std::sync::Mutex<(FxHashMap<&'static [u8], u64>, Vec<&'static [u8]>)>>,
+}
+
+impl Interner {
+    fn new() -> Self {
+        Interner { shards: (0..64).map(|_| Default::default()).collect() }
+    }
+    fn key(&self, b: &'static [u8]) -> u64 {
+        let s = (hash_bytes(b) >> 58) as usize;
+        let mut g = self.shards[s].lock().unwrap();
+        if let Some(&k) = g.0.get(b) {
+            return k;
+        }
+        let k = FB | ((g.1.len() as u64) << 6) | s as u64;
+        g.1.push(b);
+        g.0.insert(b, k);
+        k
+    }
+    fn bytes(&self, k: u64) -> &'static [u8] {
+        let g = self.shards[(k & 63) as usize].lock().unwrap();
+        g.1[((k & !FB) >> 6) as usize]
+    }
+}
+
+#[inline]
+fn hash64(k: u64) -> u64 {
+    (k ^ (k >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn map_file(p: &Path) -> Option<&'static Mmap> {
@@ -275,9 +331,9 @@ fn t(stage: &str, t0: &mut Instant) {
 
 #[derive(Clone, Copy)]
 struct ERaw {
-    eid: &'static [u8],
-    name: &'static [u8],
+    ekey: u64,
     ingest: i64,
+    pkey: u64,
     ts: u32,
     price: u32,
     cat: u16,
@@ -287,7 +343,7 @@ struct ERaw {
 
 #[derive(Clone, Copy)]
 struct Ev {
-    name: &'static [u8],
+    pkey: u64,
     ts: u32,
     price: u32,
     cat: u16,
@@ -296,19 +352,71 @@ struct Ev {
 
 #[derive(Clone, Copy)]
 struct Ck {
-    name: &'static [u8],
+    pkey: u64,
     cid: &'static [u8],
     ts: u32,
     camp: u32,
 }
 
 struct URow {
-    name: &'static [u8],
+    pkey: u64,
     day: i32,
     sessions: i64,
     events: i64,
     revenue: i64,
     top: Option<u16>,
+}
+
+/// `prefix` followed by 1..=7 digits without leading zero.
+#[inline]
+fn num(prefix: &[u8], b: &[u8]) -> Option<usize> {
+    let p = prefix.len();
+    if b.len() <= p || b.len() > p + 7 || &b[..p] != prefix || b[p] == b'0' {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in &b[p..] {
+        let d = c.wrapping_sub(b'0');
+        if d >= 10 {
+            return None;
+        }
+        v = v * 10 + d as usize;
+    }
+    Some(v)
+}
+
+/// Exact ID → value lookup: dense array for `prefix<number>` IDs, hash map otherwise.
+struct IdMap<V: Copy> {
+    prefix: &'static [u8],
+    dense: Vec<Option<V>>,
+    other: FxHashMap<&'static [u8], V>,
+}
+
+impl<V: Copy> IdMap<V> {
+    fn new(prefix: &'static [u8], items: impl Iterator<Item = (&'static [u8], V)>) -> Self {
+        let mut m = IdMap { prefix, dense: vec![], other: FxHashMap::default() };
+        for (k, v) in items {
+            match num(prefix, k) {
+                Some(n) if n < (1 << 22) => {
+                    if m.dense.len() <= n {
+                        m.dense.resize(n + 1, None);
+                    }
+                    m.dense[n].get_or_insert(v);
+                }
+                _ => {
+                    m.other.entry(k).or_insert(v);
+                }
+            }
+        }
+        m
+    }
+    #[inline]
+    fn get(&self, k: &[u8]) -> Option<V> {
+        match num(self.prefix, k) {
+            Some(n) if n < (1 << 22) => self.dense.get(n).copied().flatten(),
+            _ => self.other.get(k).copied(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- main
@@ -357,7 +465,7 @@ fn run() {
     cats.dedup();
     let cat_idx: FxHashMap<&[u8], u16> = cats.iter().enumerate().map(|(i, c)| (*c, i as u16)).collect();
     let unknown = cat_idx[&b"unknown"[..]];
-    let products: FxHashMap<&[u8], u16> = prod_raw.iter().map(|(p, c)| (*p, cat_idx[c])).collect();
+    let products: IdMap<u16> = IdMap::new(b"p", prod_raw.iter().map(|(p, c)| (*p, cat_idx[c])));
     let ncat = cats.len();
 
     // campaigns
@@ -371,7 +479,7 @@ fn run() {
             }
         });
     }
-    let camp_idx: FxHashMap<&[u8], u32> = camps.iter().enumerate().map(|(i, c)| (c.0, i as u32)).collect();
+    let camp_idx: IdMap<u32> = IdMap::new(b"c_", camps.iter().enumerate().map(|(i, c)| (c.0, i as u32)));
     let ncamp = camps.len();
     t("small_inputs", &mut t0);
 
@@ -384,17 +492,21 @@ fn run() {
     let cch = chunks(&cmaps);
     t("map_files", &mut t0);
 
+    let users = Interner::new();
+    let ukey = |b: &'static [u8]| -> u64 { pack(b'u', b).unwrap_or_else(|| users.key(b)) };
+    let eids = Interner::new();
+
     // ---------------- links
-    let pairs = par(lch.len(), nt, Vec::new, |i, v: &mut Vec<(&[u8], &[u8])>| {
+    let pairs = par(lch.len(), nt, Vec::new, |i, v: &mut Vec<(u64, u64, &[u8], &[u8])>| {
         for_lines(lch[i], |l| {
             let mut f = [&b""[..]; 2];
             if split(l, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                v.push((f[0], f[1]));
+                v.push((ukey(f[0]), ukey(f[1]), f[0], f[1]));
             }
         });
     });
-    let mut ids: FxHashMap<&[u8], u32> = FxHashMap::default();
-    let mut id_bytes: Vec<&[u8]> = vec![];
+    let mut ids: FxHashMap<u64, u32> = FxHashMap::default();
+    let mut id_bytes: Vec<(u64, &[u8])> = vec![];
     let mut parent: Vec<u32> = vec![];
     let mut size: Vec<u32> = vec![];
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -410,17 +522,17 @@ fn run() {
         r
     }
     for v in &pairs {
-        for &(a, b) in v {
-            let mut intern = |s: &'static [u8]| -> u32 {
-                *ids.entry(s).or_insert_with(|| {
-                    id_bytes.push(s);
+        for &(ka, kb, a, b) in v {
+            let mut intern = |k: u64, s: &'static [u8]| -> u32 {
+                *ids.entry(k).or_insert_with(|| {
+                    id_bytes.push((k, s));
                     parent.push(parent.len() as u32);
                     size.push(1);
                     (id_bytes.len() - 1) as u32
                 })
             };
-            let ia = intern(a);
-            let ib = intern(b);
+            let ia = intern(ka, a);
+            let ib = intern(kb, b);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
@@ -434,16 +546,24 @@ fn run() {
     let mut minid: Vec<u32> = (0..nid as u32).collect();
     for i in 0..nid as u32 {
         let r = find(&mut parent, i) as usize;
-        if id_bytes[i as usize] < id_bytes[minid[r] as usize] {
+        if id_bytes[i as usize].1 < id_bytes[minid[r] as usize].1 {
             minid[r] = i;
         }
     }
-    let names: Vec<&[u8]> = (0..nid).map(|i| id_bytes[minid[parent[i] as usize] as usize]).collect();
-    let link_name: FxHashMap<&[u8], &[u8]> = ids.iter().map(|(k, &v)| (*k, names[v as usize])).collect();
+    let mut link_map: FxHashMap<u64, u64> = FxHashMap::default();
+    for i in 0..nid {
+        let m = minid[parent[i] as usize] as usize;
+        if m != i {
+            link_map.insert(id_bytes[i].0, id_bytes[m].0);
+        }
+    }
     drop(ids);
     t("links", &mut t0);
-    let link_name = &link_name;
-    let person = move |u: &'static [u8]| -> &'static [u8] { link_name.get(u).copied().unwrap_or(u) };
+    let link_map = &link_map;
+    let person = |u: &'static [u8]| -> u64 {
+        let k = ukey(u);
+        link_map.get(&k).copied().unwrap_or(k)
+    };
 
     // ---------------- events: parse into eid buckets
     let eraw = par(
@@ -481,12 +601,13 @@ fn run() {
                 if ok && ingest.saturating_sub(tsv) > DAY {
                     ok = false;
                 }
-                let (name, cat, tsr) = if ok {
-                    (person(user), *products.get(f[5]).unwrap_or(&unknown), (tsv - base) as u32)
+                let (pkey, cat, tsr) = if ok {
+                    (person(user), products.get(f[5]).unwrap_or(unknown), (tsv - base) as u32)
                 } else {
-                    (&b""[..], 0, 0)
+                    (0, 0, 0)
                 };
-                bk[bucket(f[0])].push(ERaw { eid: f[0], name, ingest, ts: tsr, price, cat, typ, ok });
+                let ekey = pack(b'e', f[0]).unwrap_or_else(|| eids.key(f[0]));
+                bk[(hash64(ekey) >> 56) as usize].push(ERaw { ekey, ingest, pkey, ts: tsr, price, cat, typ, ok });
             });
         },
     );
@@ -502,16 +623,16 @@ fn run() {
             for tv in &eraw {
                 v.extend_from_slice(&tv[b]);
             }
-            v.sort_unstable_by(|x, y| x.eid.cmp(y.eid).then(x.ingest.cmp(&y.ingest)));
+            v.sort_unstable_by_key(|x| (x.ekey, x.ingest));
             let mut i = 0;
             while i < v.len() {
                 let r = v[i];
                 let mut j = i + 1;
-                while j < v.len() && v[j].eid == r.eid {
+                while j < v.len() && v[j].ekey == r.ekey {
                     j += 1;
                 }
                 if r.ok {
-                    out[bucket(r.name)].push(Ev { name: r.name, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
+                    out[(hash64(r.pkey) >> 56) as usize].push(Ev { pkey: r.pkey, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
                 }
                 i = j;
             }
@@ -536,16 +657,15 @@ fn run() {
                     _ => return,
                 };
                 let camp = match camp_idx.get(f[2]) {
-                    Some(&c) => c,
+                    Some(c) => c,
                     None => return,
                 };
-                let name = person(f[1]);
-                out[bucket(name)].push(Ck { name, cid: f[0], ts: (ts - base) as u32, camp });
+                let pkey = person(f[1]);
+                out[(hash64(pkey) >> 56) as usize].push(Ck { pkey, cid: f[0], ts: (ts - base) as u32, camp });
             });
         },
     );
     t("parse_clicks", &mut t0);
-
     // ---------------- sessionize + attribute
     let nc1 = ncamp + 1;
     let results = par(
@@ -561,21 +681,21 @@ fn run() {
             for tv in &ckb {
                 ck.extend_from_slice(&tv[b]);
             }
-            ev.sort_unstable_by(|x, y| x.name.cmp(y.name).then(x.ts.cmp(&y.ts)));
-            ck.sort_unstable_by(|x, y| x.name.cmp(y.name).then(x.ts.cmp(&y.ts)).then(x.cid.cmp(y.cid)));
+            ev.sort_unstable_by_key(|x| (x.pkey, x.ts));
+            ck.sort_unstable_by(|x, y| (x.pkey, x.ts).cmp(&(y.pkey, y.ts)).then_with(|| x.cid.cmp(y.cid)));
             let mut ci = 0;
             let mut i = 0;
             while i < ev.len() {
-                let name = ev[i].name;
+                let pkey = ev[i].pkey;
                 let mut iend = i + 1;
-                while iend < ev.len() && ev[iend].name == name {
+                while iend < ev.len() && ev[iend].pkey == pkey {
                     iend += 1;
                 }
-                while ci < ck.len() && ck[ci].name < name {
+                while ci < ck.len() && ck[ci].pkey < pkey {
                     ci += 1;
                 }
                 let mut cend = ci;
-                while cend < ck.len() && ck[cend].name == name {
+                while cend < ck.len() && ck[cend].pkey == pkey {
                     cend += 1;
                 }
                 let e = &ev[i..iend];
@@ -584,7 +704,7 @@ fn run() {
                 let (mut lo, mut hi) = (0usize, 0usize);
                 act.clear();
                 let mut cur_day = i32::MIN;
-                let mut row = URow { name, day: 0, sessions: 0, events: 0, revenue: 0, top: None };
+                let mut row = URow { pkey, day: 0, sessions: 0, events: 0, revenue: 0, top: None };
                 let mut any_purchase = false;
                 fn flush(row: &mut URow, catsum: &mut [i64], any: bool, urows: &mut Vec<URow>) {
                     let top = if any {
@@ -598,7 +718,7 @@ fn run() {
                     } else {
                         None
                     };
-                    urows.push(URow { name: row.name, day: row.day, sessions: row.sessions, events: row.events, revenue: row.revenue, top });
+                    urows.push(URow { pkey: row.pkey, day: row.day, sessions: row.sessions, events: row.events, revenue: row.revenue, top });
                     catsum.iter_mut().for_each(|x| *x = 0);
                 }
                 let mut k = 0;
@@ -616,7 +736,7 @@ fn run() {
                             flush(&mut row, catsum, any_purchase, urows);
                         }
                         cur_day = day;
-                        row = URow { name, day, sessions: 0, events: 0, revenue: 0, top: None };
+                        row = URow { pkey, day, sessions: 0, events: 0, revenue: 0, top: None };
                         any_purchase = false;
                     }
                     let mut rev = 0i64;
@@ -706,7 +826,8 @@ fn run() {
         for (ti, r) in results.iter().enumerate() {
             let ud = &ud;
             let cats = &cats;
-            sc.spawn(move || write_user(&ud.join(format!("part-{ti}.parquet")), &r.0, cats));
+            let users = &users;
+            sc.spawn(move || write_user(&ud.join(format!("part-{ti}.parquet")), &r.0, cats, users));
         }
         write_camp(&cd.join("part-0.parquet"), &camp_tot, &camps, ndays, day0);
     });
@@ -765,7 +886,7 @@ fn write_cols(path: &Path, schema: &str, cols: Vec<Col>, nrows: usize) {
     inner.flush().expect("flush");
 }
 
-fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]]) {
+fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], users: &Interner) {
     let mut defs = Vec::with_capacity(rows.len());
     let mut tops = vec![];
     for r in rows {
@@ -778,7 +899,20 @@ fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]]) {
         }
     }
     let cols = vec![
-        Col::S(rows.iter().map(|r| ByteArray::from(r.name.to_vec())).collect(), None),
+        Col::S(
+            rows.iter()
+                .map(|r| {
+                    if r.pkey & FB != 0 {
+                        ByteArray::from(users.bytes(r.pkey).to_vec())
+                    } else {
+                        let mut v = Vec::with_capacity(9);
+                        unpack(b'u', r.pkey, &mut v);
+                        ByteArray::from(v)
+                    }
+                })
+                .collect(),
+            None,
+        ),
         Col::I32(rows.iter().map(|r| r.day).collect()),
         Col::I64(rows.iter().map(|r| r.sessions).collect()),
         Col::I64(rows.iter().map(|r| r.events).collect()),
