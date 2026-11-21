@@ -1,0 +1,16 @@
+/data/
+/out/
+/out-*/
+/target/
+/.venv/
+/starter-duckdb/
+/generator/
+/dev-answer/
+*.zip
+*.csv
+*.parquet
+
+
+# Added by cargo
+
+/target
