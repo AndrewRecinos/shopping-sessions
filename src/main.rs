@@ -370,7 +370,7 @@ fn stage1_variants() -> Vec<(&'static str, Stage1)> {
 /// AVX-512 variants were verified under Intel SDE 10.13.1 (-clx) with forced builds on the fuzz
 /// test, 36 fixtures, dev and 20M (identical). Preferred variant when usable; else avx2/sse2.
 const AVX512_VERIFIED: bool = true;
-const PREFER: &str = if AVX512_VERIFIED { "avx512vl" } else { "avx2" };
+const PREFER: &str = if AVX512_VERIFIED { "avx512" } else { "avx2" };
 
 static STAGE1: std::sync::OnceLock<(&'static str, Stage1)> = std::sync::OnceLock::new();
 
