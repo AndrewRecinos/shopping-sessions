@@ -215,3 +215,28 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   wall 5.05 / 4.21 / 3.72 s, exit 0, no OOM; peak RSS ~10.6 GB = ~5.5 GB file-mapped input
   (reclaimable) + ~5 GB anon. Binary logs `mem peak` (VmHWM) to stderr at exit. Docker here
   runs in a VM, so container cgroup memory.peak isn't readable from WSL.
+- Round 3 (structural; scorer: dba3bad = 1.67 s vs bench 1.267 s). Local A/B = interleaved pinned runs
+  of two binaries (median/min internal); docker bench in this session was noisy (+-0.05 s).
+  IDs are scrambled base36 (40-bit bijection with a secret per-dataset key) -> NOT dense; no flat arrays.
+  - hash-table dedup per eid bucket (L2 table of u32 idx, no sort) + counting sort by person rank in
+    sessionize, per-person insertion sort of (ts<<32|pc), clicks sorted by ts only (cid tie resolved at
+    credit time): wall 1.267 -> 1.067 s, internal 0.975 -> 0.763 s
+  - exact day-of-month date table + SWAR HH:MM:SS (1-entry cache missed ~93%: lines are in random date
+    order): parse_events 0.35 -> 0.28 s; wall 1.034 s, internal 0.702 s
+  - links: one lock-free open-addressing table (slot = node id) filled during parse, lock-free parallel
+    union-find (CAS link-by-index + path halving), compact moved-ID lookup table: links 0.067 -> 0.045 s
+  - parquet: INT32 sessions/events, no statistics, dictionary for top_category: write 0.044 -> 0.036 s
+  - CSV splitter without per-field dependency chain (separator-only index + quote bitmask words, quotes
+    checked by start/end byte + popcount): parse_events 0.288 -> 0.256 s; internal ~0.675-0.687 s docker
+  - pre-sized click person buckets: parse_clicks 0.066 -> 0.060 s
+  - tried, no gain: one job queue overlapping links with event parse (CPU-bound: overlap only adds
+    contention; single-thread link post took 0.27 s), person lookup pipelined into parse (+0.085 parse,
+    -0.056 dedup), link-table bit filter (even with filtered prefetch), AVX2 stage-1 (index-store bound),
+    whole-binary AVX2 codegen (slower), u128-window splitter, MAP_POPULATE (file faults ~3 ms total),
+    mimalloc purge/large pages, bucket counts 512/2048/4096 (also at 60M), 12/16 threads, zero-copy
+    parquet strings, SWAR event_type, adaptive person-table size.
+  - remaining (local pinned, ~0.64 s): parse_events 0.255 (split ~0.12, fields ~0.09, push 0.03),
+    dedup 0.12 (gather+hash 0.045, link lookup 0.04, scatter 0.03), sessionize 0.11, clicks 0.06,
+    links 0.05, write 0.036.
+- [x] 60M check (seed 3, data/g60 kept, reference out-ref/g60 = output of 7cdef88): identical,
+  local 5.6 s -> ~2.1 s, peak 10 GB (anon 4.1 GB).
