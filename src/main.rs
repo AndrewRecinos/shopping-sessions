@@ -509,33 +509,67 @@ fn huge_slice<T: Copy>(n: usize, init: T) -> &'static mut [T] {
     s
 }
 
-/// Open-addressing u64 -> u64 table (linear probing within 64 regions chosen by the
-/// top 6 hash bits, so regions can be filled in parallel). Missing key -> key itself.
+/// Lock-free open-addressing table of link IDs: slot index = node id, value = person key.
+/// Linear probing over the whole table; a missing key maps to itself.
+#[repr(C)]
+struct Slot {
+    k: std::sync::atomic::AtomicU64,
+    v: std::sync::atomic::AtomicU64,
+}
+
 struct LTab {
-    slots: &'static mut [(u64, u64)],
-    shift: u32,
-    rmask: usize,
+    slots: &'static [Slot],
 }
 
 impl LTab {
+    fn new(n: usize) -> Self {
+        let raw = huge_slice(n * 2, EMPTY);
+        LTab { slots: unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const Slot, n) } }
+    }
     #[inline(always)]
     fn home(&self, k: u64) -> usize {
-        (hash64(k) >> self.shift) as usize
+        ((hash64(k) as u128 * self.slots.len() as u128) >> 64) as usize
+    }
+    /// Slot of `k`, inserting it if absent.
+    fn insert(&self, k: u64) -> u32 {
+        let n = self.slots.len();
+        let mut i = self.home(k);
+        loop {
+            let s = &self.slots[i];
+            let cur = s.k.load(Ordering::Relaxed);
+            if cur == k {
+                return i as u32;
+            }
+            if cur == EMPTY {
+                match s.k.compare_exchange(EMPTY, k, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => return i as u32,
+                    Err(c) if c == k => return i as u32,
+                    Err(_) => {}
+                }
+            }
+            i += 1;
+            if i == n {
+                i = 0;
+            }
+        }
     }
     #[inline(always)]
     fn get(&self, k: u64) -> u64 {
-        let h = self.home(k);
-        let base = h & !self.rmask;
-        let mut i = h;
+        let n = self.slots.len();
+        let mut i = self.home(k);
         loop {
-            let (kk, v) = unsafe { *self.slots.get_unchecked(i) };
+            let s = unsafe { self.slots.get_unchecked(i) };
+            let kk = s.k.load(Ordering::Relaxed);
             if kk == k {
-                return v;
+                return s.v.load(Ordering::Relaxed);
             }
             if kk == EMPTY {
                 return k;
             }
-            i = base | ((i + 1) & self.rmask);
+            i += 1;
+            if i == n {
+                i = 0;
+            }
         }
     }
     #[inline(always)]
@@ -799,98 +833,76 @@ fn run() {
     let eids = Interner::new();
 
     // ---------------- links
-    const LS: usize = 64;
-    let lshard = |k: u64| (hash64(k) >> 58) as usize;
-    let lparsed = par(
-        lch.len(),
-        nt,
-        || (Vec::new(), (0..LS).map(|_| Vec::new()).collect::<Vec<_>>()),
-        |i, (pv, sh): &mut (Vec<(u64, u64)>, Vec<Vec<(u64, &'static [u8])>>)| {
-            for_rows::<2>(lch[i], |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    let (ka, kb) = (ukey(f[0]), ukey(f[1]));
-                    pv.push((ka, kb));
-                    sh[lshard(ka)].push((ka, f[0]));
-                    sh[lshard(kb)].push((kb, f[1]));
-                }
-            });
-        },
-    );
-    // intern per shard: key -> local index (later overwritten with the person key)
-    let mut shards: Vec<(FxHashMap<u64, u64>, Vec<(u64, &[u8])>)> = (0..LS).map(|_| Default::default()).collect();
-    {
-        let slots: Vec<std::sync::Mutex<&mut (FxHashMap<u64, u64>, Vec<(u64, &[u8])>)>> =
-            shards.iter_mut().map(std::sync::Mutex::new).collect();
-        par(LS, nt, || (), |sidx, _| {
-            let mut g = slots[sidx].lock().unwrap();
-            let (m, ids) = &mut **g;
-            for tp in &lparsed {
-                for &(k, b) in &tp.1[sidx] {
-                    m.entry(k).or_insert_with(|| {
-                        ids.push((k, b));
-                        (ids.len() - 1) as u64
-                    });
-                }
+    let nlines: usize = lmaps.iter().map(|m| memchr::memchr_iter(b'\n', m).count() + 1).sum();
+    let ltab = LTab::new(nlines * 5 / 2 + 64);
+    let nslot = ltab.slots.len();
+    let upairs = par(lch.len(), nt, Vec::new, |i, pv: &mut Vec<(u32, u32)>| {
+        for_rows::<2>(lch[i], |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                pv.push((ltab.insert(ukey(f[0])), ltab.insert(ukey(f[1]))));
             }
         });
-    }
-    let mut off = vec![0usize; LS + 1];
-    for sidx in 0..LS {
-        off[sidx + 1] = off[sidx] + shards[sidx].1.len();
-    }
-    let nid = off[LS];
-    let gid = |k: u64| -> u32 {
-        let sidx = lshard(k);
-        (off[sidx] + shards[sidx].0[&k] as usize) as u32
-    };
-    let upairs = par(lparsed.len(), nt, Vec::new, |ti, v: &mut Vec<(u32, u32)>| {
-        v.extend(lparsed[ti].0.iter().map(|&(a, b)| (gid(a), gid(b))));
     });
-    let mut parent: Vec<u32> = (0..nid as u32).collect();
-    let mut size: Vec<u32> = vec![1; nid];
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while parent[r as usize] != r {
-            r = parent[r as usize];
+    // lock-free union-find: link the larger root under the smaller (CAS), path halving
+    use std::sync::atomic::AtomicU32;
+    let parent: Vec<AtomicU32> = (0..nslot as u32).map(AtomicU32::new).collect();
+    let find = |mut x: u32| -> u32 {
+        loop {
+            let p = parent[x as usize].load(Ordering::Relaxed);
+            if p == x {
+                return x;
+            }
+            let g = parent[p as usize].load(Ordering::Relaxed);
+            if g != p {
+                let _ = parent[x as usize].compare_exchange_weak(p, g, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            x = g;
         }
-        while parent[x as usize] != r {
-            let n = parent[x as usize];
-            parent[x as usize] = r;
-            x = n;
-        }
-        r
-    }
-    for v in &upairs {
-        for &(ia, ib) in v {
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
-                parent[small as usize] = big;
-                size[big as usize] += size[small as usize];
+    };
+    par(upairs.len(), nt, || (), |t, _| {
+        for &(a, b) in &upairs[t] {
+            let (mut a, mut b) = (a, b);
+            loop {
+                a = find(a);
+                b = find(b);
+                if a == b {
+                    break;
+                }
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                if parent[hi as usize].compare_exchange(hi, lo, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    break;
+                }
             }
         }
-    }
-    let all_ids: Vec<(u64, &[u8])> = (0..LS).flat_map(|sidx| shards[sidx].1.iter().copied()).collect();
-    // roots (read-only walks) and component minimum ID, both in parallel
-    use std::sync::atomic::AtomicU32;
+    });
+    let parent: Vec<u32> = parent.into_iter().map(|x| x.into_inner()).collect();
+    // component root and byte-wise minimum ID (atomic min), then value = that ID's key
     const RB: usize = 1 << 16;
-    let nrb = nid.div_ceil(RB);
-    let root: Vec<AtomicU32> = (0..nid).map(|_| AtomicU32::new(0)).collect();
-    let minid: Vec<AtomicU32> = (0..nid).map(|_| AtomicU32::new(u32::MAX)).collect();
+    let nrb = nslot.div_ceil(RB);
+    let minid: Vec<AtomicU32> = (0..nslot).map(|_| AtomicU32::new(u32::MAX)).collect();
     {
-        let (parent, root, minid, all_ids) = (&parent, &root, &minid, &all_ids);
+        let (parent, minid, users) = (&parent, &minid, &users);
+        let key = |i: u32| ltab.slots[i as usize].k.load(Ordering::Relaxed);
         let less = |i: u32, j: u32| {
-            let (a, b) = (all_ids[i as usize], all_ids[j as usize]);
-            if (a.0 | b.0) & FB == 0 { a.0 < b.0 } else { a.1 < b.1 }
+            let (a, b) = (key(i), key(j));
+            if (a | b) & FB == 0 {
+                a < b
+            } else {
+                let (mut x, mut y) = (Vec::new(), Vec::new());
+                let ab: &[u8] = if a & FB != 0 { users.bytes(a) } else { unpack(b'u', a, &mut x); &x };
+                let bb: &[u8] = if b & FB != 0 { users.bytes(b) } else { unpack(b'u', b, &mut y); &y };
+                ab < bb
+            }
         };
         par(nrb, nt, || (), |q, _| {
-            for i in q * RB..((q + 1) * RB).min(nid) {
+            for i in q * RB..((q + 1) * RB).min(nslot) {
+                if key(i as u32) == EMPTY {
+                    continue;
+                }
                 let mut r = i as u32;
                 while parent[r as usize] != r {
                     r = parent[r as usize];
                 }
-                root[i].store(r, Ordering::Relaxed);
                 let m = &minid[r as usize];
                 let mut cur = m.load(Ordering::Relaxed);
                 while cur == u32::MAX || less(i as u32, cur) {
@@ -901,45 +913,40 @@ fn run() {
                 }
             }
         });
-    }
-    {
-        let (root, minid, all_ids, off) = (&root, &minid, &all_ids, &off);
-        let slots: Vec<std::sync::Mutex<&mut (FxHashMap<u64, u64>, Vec<(u64, &[u8])>)>> =
-            shards.iter_mut().map(std::sync::Mutex::new).collect();
-        par(LS, nt, || (), |sidx, _| {
-            let mut g = slots[sidx].lock().unwrap();
-            g.0.retain(|&k, v| {
-                let gi = off[sidx] + *v as usize;
-                *v = all_ids[minid[root[gi].load(Ordering::Relaxed) as usize].load(Ordering::Relaxed) as usize].0;
-                *v != k
-            });
-            g.0.shrink_to_fit();
-        });
-    }
-    drop(upairs);
-    drop(lparsed);
-    t("links", &mut t0);
-    // flatten into the open-addressing table; region r holds shard r's keys
-    let maxn = shards.iter().map(|s| s.0.len()).max().unwrap_or(0);
-    let rsize = (maxn * 2).next_power_of_two().max(16);
-    let ltab = LTab { slots: huge_slice(rsize * LS, (EMPTY, 0)), shift: 64 - (rsize * LS).trailing_zeros(), rmask: rsize - 1 };
-    {
-        let shift = ltab.shift;
-        let regions: Vec<std::sync::Mutex<&mut [(u64, u64)]>> = ltab.slots.chunks_mut(rsize).map(std::sync::Mutex::new).collect();
-        let shards = &shards;
-        par(LS, nt, || (), |r, _| {
-            let mut reg = regions[r].lock().unwrap();
-            for (&k, &v) in &shards[r].0 {
-                let mut i = (hash64(k) >> shift) as usize & (rsize - 1);
-                while reg[i].0 != EMPTY {
-                    i = (i + 1) & (rsize - 1);
+        par(nrb, nt, || (), |q, _| {
+            for i in q * RB..((q + 1) * RB).min(nslot) {
+                if key(i as u32) == EMPTY {
+                    continue;
                 }
-                reg[i] = (k, v);
+                let mut r = i as u32;
+                while parent[r as usize] != r {
+                    r = parent[r as usize];
+                }
+                let s = &ltab.slots[i];
+                s.v.store(key(minid[r as usize].load(Ordering::Relaxed)), Ordering::Relaxed);
             }
         });
     }
-    drop(shards);
-    let ltab = &ltab;
+    drop(upairs);
+    drop(parent);
+    drop(minid);
+    // compact lookup table holding only IDs whose person key differs from their own
+    let moved = |s: &Slot| {
+        let k = s.k.load(Ordering::Relaxed);
+        k != EMPTY && s.v.load(Ordering::Relaxed) != k
+    };
+    let nmoved: usize = par(nrb, nt, || 0usize, |q, c| *c += ltab.slots[q * RB..((q + 1) * RB).min(nslot)].iter().filter(|s| moved(s)).count()).iter().sum();
+    let ctab = LTab::new(nmoved * 2 + 64);
+    par(nrb, nt, || (), |q, _| {
+        for s in &ltab.slots[q * RB..((q + 1) * RB).min(nslot)] {
+            if moved(s) {
+                let i = ctab.insert(s.k.load(Ordering::Relaxed));
+                ctab.slots[i as usize].v.store(s.v.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+    });
+    t("links", &mut t0);
+    let ltab = &ctab;
     // ---------------- events: parse into eid buckets
     let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / nt / NB;
     let wide1: std::sync::Mutex<FxHashMap<(u64, i64), u16>> = Default::default();
