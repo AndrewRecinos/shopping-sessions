@@ -12,6 +12,8 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Category field value meaning "category >= ESC, see the side tables" (only with > 255 categories).
+const ESC: u32 = 255;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
@@ -614,21 +616,16 @@ fn t(stage: &str, t0: &mut Instant) {
 struct ERaw {
     ekey: u64,
     ingest: i64,
-    pkey: u64,
+    pkey: u64, // 0 = invalid / late
     ts: u32,
-    price: u32,
-    cat: u16,
-    typ: u8,
-    ok: bool,
+    pc: u32, // purchase price (24 bits, 0 = not a purchase) | category << 24
 }
 
 #[derive(Clone, Copy)]
 struct Ev {
     pkey: u64,
     ts: u32,
-    price: u32,
-    cat: u16,
-    typ: u8, // 2 = purchase
+    pc: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -920,6 +917,8 @@ fn run() {
     let ltab = &ltab;
     // ---------------- events: parse into eid buckets
     let ecap = ech.iter().map(|c| c.len()).sum::<usize>() / 64 / nt / NB;
+    let wide1: std::sync::Mutex<FxHashMap<(u64, i64), u16>> = Default::default();
+    let wide2: std::sync::Mutex<Vec<(u64, u32, u32, u16)>> = Default::default();
     let eraw = par(
         ech.len(),
         nt,
@@ -961,7 +960,14 @@ fn run() {
                     (0, 0, 0)
                 };
                 let ekey = pack(b'e', f[0]).unwrap_or_else(|| eids.key(f[0]));
-                bk[(hash64(ekey) >> (64 - NBB)) as usize].push(ERaw { ekey, ingest, pkey, ts: tsr, price, cat, typ, ok });
+                let mut c = cat as u32;
+                if c >= ESC {
+                    if pkey != 0 && price != 0 {
+                        wide1.lock().unwrap().insert((ekey, ingest), cat);
+                    }
+                    c = ESC;
+                }
+                bk[(hash64(ekey) >> (64 - NBB)) as usize].push(ERaw { ekey, ingest, pkey, ts: tsr, pc: price | c << 24 });
             });
         },
     );
@@ -993,8 +999,12 @@ fn run() {
                 while j < v.len() && v[j].ekey == r.ekey {
                     j += 1;
                 }
-                if r.ok {
-                    out[(hash64(r.pkey) >> (64 - NBB)) as usize].push(Ev { pkey: r.pkey, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
+                if r.pkey != 0 {
+                    if r.pc >> 24 == ESC && r.pc & 0xFF_FFFF != 0 {
+                        let c = wide1.lock().unwrap()[&(r.ekey, r.ingest)];
+                        wide2.lock().unwrap().push((r.pkey, r.ts, r.pc & 0xFF_FFFF, c));
+                    }
+                    out[(hash64(r.pkey) >> (64 - NBB)) as usize].push(Ev { pkey: r.pkey, ts: r.ts, pc: r.pc });
                 }
                 i = j;
             }
@@ -1040,6 +1050,12 @@ fn run() {
     t("parse_clicks", &mut t0);
     // ---------------- sessionize + attribute
     let nc1 = ncamp + 1;
+    // wide-category purchases per person bucket, in (person, ts) order
+    let mut wide: Vec<Vec<(u64, u32, u32, u16)>> = (0..NB).map(|_| Vec::new()).collect();
+    for w in wide2.into_inner().unwrap() {
+        wide[(hash64(w.0) >> (64 - NBB)) as usize].push(w);
+    }
+    wide.iter_mut().for_each(|v| v.sort_unstable());
     let results = par(
         NB,
         nt,
@@ -1056,6 +1072,7 @@ fn run() {
             ev.sort_unstable_by_key(|x| (x.pkey, x.ts));
             ck.sort_unstable_by(|x, y| (x.pkey, x.ts).cmp(&(y.pkey, y.ts)).then_with(|| x.cid.cmp(y.cid)));
             let mut ci = 0;
+            let mut wi = 0;
             let mut i = 0;
             while i < ev.len() {
                 let pkey = ev[i].pkey;
@@ -1114,9 +1131,17 @@ fn run() {
                     let mut rev = 0i64;
                     let mut purch = false;
                     for x in &e[k..j] {
-                        if x.typ == 2 {
-                            rev += x.price as i64;
-                            catsum[x.cat as usize] += x.price as i64;
+                        let mut price = (x.pc & 0xFF_FFFF) as i64;
+                        let mut cat = (x.pc >> 24) as usize;
+                        if cat == ESC as usize && price != 0 {
+                            let w = wide[b][wi];
+                            wi += 1;
+                            debug_assert!(w.0 == pkey && w.1 == x.ts);
+                            (price, cat) = (w.2 as i64, w.3 as usize);
+                        }
+                        if price != 0 {
+                            rev += price;
+                            catsum[cat] += price;
                             purch = true;
                         }
                     }
