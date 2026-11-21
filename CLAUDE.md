@@ -198,6 +198,19 @@ tables; Σassisted ≥ Σ non-organic credited sessions.
   - 1024 hash buckets instead of 256 (buckets fit L2; local A/B total min 0.96->0.79, med 1.01->0.94): docker ~1.13-1.26 s (noisy)
   - clicks: two-pass chunk parse with prefetched person lookup (parse_clicks 0.078->0.051s): 1.06 s
   - tried, no gain (reverted): link bitset filter, hash-table dedup (slower than sort), u64 composite session sort key, MIMALLOC_LARGE_OS_PAGES
+- Round 2 (scorer: 0ee9b38 = 2.14 s on 20M with 8 pinned HT = 4 cores x 2). bench.sh now pins
+  `--cpuset-cpus` to 4 physical cores + siblings (2-9), 7 runs, prints median wall + median internal
+  total. Pinned baseline 0ee9b38: wall 1.467 s / internal 1.143 s. Docker overhead for an instantly
+  exiting container is ~0.27 s (not reducible from the binary). 8 vs 16 threads: no difference.
+  - cached-date ts fast path (fuzz-tested vs parse_ts): parse_events 0.49 -> 0.44 s local
+  - pre-sized per-thread event buckets: wall 1.367 s / internal 1.054 s
+  - parallel root + atomic-min component names in links: links 0.091 -> 0.064 s local
+  - SWAR ID packing (page-safe 8-byte load, fuzz-tested): wall 1.298 s / internal 0.991 s
+  - compact records ERaw 32 B / Ev 16 B (price24|cat8; >255 categories go through an exact side
+    table, verified by forcing ESC=1/3 on fixtures + 20M): wall 1.267 s / internal 0.975 s
+  - tried, no gain: 64-way radix pre-pass before dedup sorts; 16 threads
+  - remaining (local pinned): parse_events 0.34, dedup 0.21, sessionize 0.17, parse_clicks 0.07,
+    links 0.06, write 0.04. Parquet writer is only 0.04 s: hand-written writer not worth it.
 - [x] 60M safety run (seed 3, 60M events / 15M clicks, 5.4 GB; data deleted after): 3 docker runs
   wall 5.05 / 4.21 / 3.72 s, exit 0, no OOM; peak RSS ~10.6 GB = ~5.5 GB file-mapped input
   (reclaimable) + ~5 GB anon. Binary logs `mem peak` (VmHWM) to stderr at exit. Docker here
