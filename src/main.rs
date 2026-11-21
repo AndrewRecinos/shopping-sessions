@@ -396,11 +396,27 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 /// Pack `prefix[0-9a-z]{1,8}` into a u64 (big-endian, zero padded; top bit 0).
 /// Injective, and preserves byte order among packed IDs of the same prefix.
-#[inline]
+#[inline(always)]
 fn pack(prefix: u8, b: &[u8]) -> Option<u64> {
     let n = b.len();
     if n < 2 || n > 9 || b[0] != prefix {
         return None;
+    }
+    let end = b.as_ptr() as usize + n;
+    if (end - 8) >> 12 == (end - 1) >> 12 {
+        // SWAR: load the 8 bytes ending at the field end (same page as its last byte)
+        let w = u64::from_be_bytes(unsafe { std::ptr::read_unaligned((end - 8) as *const [u8; 8]) });
+        let k = n - 1;
+        let m80 = 0x8080_8080_8080_8080u64 >> (8 * (8 - k));
+        let mask = u64::MAX >> (8 * (8 - k));
+        let x = w & mask;
+        let lo7 = x & 0x7F7F_7F7F_7F7F_7F7F;
+        let ge0 = lo7.wrapping_add(0x5050_5050_5050_5050);
+        let lt9 = !lo7.wrapping_add(0x4646_4646_4646_4646);
+        let gea = lo7.wrapping_add(0x1F1F_1F1F_1F1F_1F1F);
+        let ltz = !lo7.wrapping_add(0x0505_0505_0505_0505);
+        let valid = ((ge0 & lt9) | (gea & ltz)) & !x & m80;
+        return if valid == m80 { Some(x << (8 * (9 - n))) } else { None };
     }
     let mut v = 0u64;
     for &c in &b[1..] {
@@ -1381,6 +1397,32 @@ mod tests {
                 }
             }
             assert_eq!(parse_ts(&v), parse_ts_c(&v, &mut tc), "it={it} {:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn pack_swar_matches() {
+        fn slow(prefix: u8, b: &[u8]) -> Option<u64> {
+            let n = b.len();
+            if n < 2 || n > 9 || b[0] != prefix { return None; }
+            let mut v = 0u64;
+            for &c in &b[1..] {
+                if !(c.is_ascii_digit() || c.is_ascii_lowercase()) { return None; }
+                v = (v << 8) | c as u64;
+            }
+            Some(v << (8 * (9 - n)))
+        }
+        let mut x: u64 = 99;
+        let buf: Vec<u8> = (0..20000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let a = b"u0123456789abcxyz/:`{AZ \x80\xff"; a[(x % a.len() as u64) as usize] }).collect();
+        for i in 0..buf.len() - 12 {
+            for n in 0..11 {
+                let mut b = buf[i..i + n].to_vec();
+                if !b.is_empty() { b[0] = b'u'; }
+                let mut pad = vec![b'x'; 16]; pad.extend_from_slice(&b);
+                let f = &pad[16..];
+                assert_eq!(slow(b'u', f), pack(b'u', f), "{:?}", f);
+            }
         }
     }
 }
